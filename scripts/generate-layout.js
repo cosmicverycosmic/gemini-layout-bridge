@@ -67,12 +67,12 @@ function collectCss(appDir) {
 }
 
 /**
- * Extract <header>/<section>/<main>/<footer> blocks from HTML/JSX.
+ * Extract <section>...</section>-style blocks from HTML-ish strings.
  * If none found, return the whole HTML as one section.
  */
 function splitHtmlIntoSections(html) {
   const sections = [];
-  const re = /<(header|section|main|footer)[\s\S]*?<\/\1>/gi;
+  const re = /<(section|header|main|footer)[^>]*>[\s\S]*?<\/\1>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
     sections.push(m[0]);
@@ -84,8 +84,25 @@ function splitHtmlIntoSections(html) {
 }
 
 /**
+ * For React apps, try to extract sections from App.tsx / app.tsx specifically.
+ */
+function extractReactSectionsFromApp(tsxPath) {
+  const src = fs.readFileSync(tsxPath, "utf8");
+  const sections = [];
+  const re = /<(header|section|main|footer)[^>]*>[\s\S]*?<\/\1>/gi;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    sections.push(m[0]);
+  }
+  if (!sections.length) {
+    sections.push('<div id="root"></div>');
+  }
+  return { sections, fullTsx: src };
+}
+
+/**
  * Detect whether this is an Angular or React app, and obtain
- * base HTML/JSX content + an array of section strings.
+ * base HTML content + an array of section HTML strings.
  */
 function analyzeApp(appDir) {
   log("Analyzing app at", appDir);
@@ -93,107 +110,86 @@ function analyzeApp(appDir) {
   const angularAppHtml = path.join(appDir, "src", "app", "app.component.html");
   const tsxFiles = walkFiles(appDir).filter((f) => f.endsWith(".tsx"));
 
-  // Angular
   if (fs.existsSync(angularAppHtml)) {
     log("Detected Angular app; app.component.html found.");
     const full = fs.readFileSync(angularAppHtml, "utf8");
     const sections = splitHtmlIntoSections(full);
     return {
       framework: "angular",
+      framework_source: full,
       fullHtml: full,
       sections,
-      appSource: full,
     };
   }
 
-  // React / TSX
   if (tsxFiles.length > 0) {
+    // Prefer App.tsx / app.tsx as the primary entry.
+    let primaryTsx = tsxFiles.find((f) =>
+      /(?:^|\/)App\.tsx$/i.test(f)
+    );
+    if (!primaryTsx) {
+      primaryTsx = tsxFiles.find((f) =>
+        /(?:^|\/)index\.tsx$/i.test(f)
+      ) || tsxFiles[0];
+    }
+
     log("Detected React/TSX app; TSX files found.");
+    log("Using primary React entry file:", path.relative(appDir, primaryTsx));
 
-    // Prefer App.tsx if present
-    const candidates = [
-      path.join(appDir, "src", "App.tsx"),
-      path.join(appDir, "App.tsx"),
-      path.join(appDir, "src", "app", "App.tsx"),
-    ];
-    let primary = null;
-    for (const c of candidates) {
-      if (fs.existsSync(c)) {
-        primary = c;
-        break;
-      }
-    }
+    const { sections, fullTsx } = extractReactSectionsFromApp(primaryTsx);
+    const combinedHtml = sections.join("\n\n");
 
-    let combinedHtml = "";
-    let appSource = "";
-
-    if (primary) {
-      appSource = fs.readFileSync(primary, "utf8");
-      combinedHtml = appSource;
-      log("Using primary React entry file:", primary);
-    } else {
-      // Fallback: concatenate TSX fragments
-      for (const f of tsxFiles) {
-        const src = fs.readFileSync(f, "utf8");
-        const match = src.match(
-          /<(header|section|main|footer)[\s\S]*?<\/\1>/i
-        );
-        if (match) {
-          combinedHtml += "\n" + match[0] + "\n";
-        }
-      }
-      if (!combinedHtml.trim()) {
-        combinedHtml = '<div id="root"></div>';
-      }
-      appSource = combinedHtml;
-    }
-
-    const sections = splitHtmlIntoSections(combinedHtml);
     return {
       framework: "react",
+      framework_source: fullTsx,
       fullHtml: combinedHtml,
       sections,
-      appSource,
     };
   }
 
-  // Fallback: try static index.html
+  // Fallback: try index.html
   const indexHtml = path.join(appDir, "index.html");
   if (fs.existsSync(indexHtml)) {
     const full = fs.readFileSync(indexHtml, "utf8");
     const sections = splitHtmlIntoSections(full);
     return {
       framework: "static",
+      framework_source: full,
       fullHtml: full,
       sections,
-      appSource: full,
     };
   }
 
   // As a last resort, create a trivial root section.
-  log("No Angular/React/index.html found; using trivial root section.");
+  log("No Angular or TSX or index.html found; using trivial root section.");
   const trivialHtml = '<div id="root"></div>';
   return {
     framework: "unknown",
+    framework_source: trivialHtml,
     fullHtml: trivialHtml,
     sections: [trivialHtml],
-    appSource: trivialHtml,
   };
 }
 
 /**
- * Call the Python classifier for a single section snippet.
+ * Call the Python classifier for a single section HTML snippet.
  * We send a JSON payload on stdin to avoid escaping issues.
  */
-function classifySection(sectionHtml, context) {
+function classifySection(sectionHtml, appInfo, idx, pageTitle) {
   const payload = {
     html: sectionHtml,
-    context: context || "",
+    context: {
+      framework: appInfo.framework,
+      pageTitle: pageTitle || "",
+      sectionIndex: idx,
+      framework_source: appInfo.framework_source || "",
+    },
   };
 
   const env = { ...process.env };
+  // Default model is now set inside the Python script,
+  // but we keep a sane fallback here if needed.
   if (!env.GLB_LLM_MODEL) {
-    // Default if not set at workflow level
     env.GLB_LLM_MODEL = "microsoft/Phi-3-mini-4k-instruct";
   }
 
@@ -210,8 +206,7 @@ function classifySection(sectionHtml, context) {
 
   if (res.status !== 0) {
     console.error("[LLM] classifier non-zero exit:", res.status);
-    if (res.stderr) console.error(res.stderr);
-    else if (res.stdout) console.error(res.stdout);
+    console.error(res.stderr || res.stdout);
     return null;
   }
 
@@ -228,6 +223,79 @@ function classifySection(sectionHtml, context) {
     console.error("[LLM] JSON parse error, stdout was:", stdout);
     return null;
   }
+}
+
+/**
+ * Simple heuristics to veto obviously-wrong module picks.
+ * e.g. don't create a contact form when there's no form / contact cues.
+ */
+function applyHeuristicOverrides(sectionHtml, classification, sectionId) {
+  if (!classification || typeof classification !== "object") return classification;
+
+  const updated = JSON.parse(JSON.stringify(classification));
+  const divi = (updated.builder && updated.builder.divi) || {};
+  const mt = (divi.module_type || "").toLowerCase();
+
+  const lower = sectionHtml.toLowerCase();
+  const hasFormTag = /<form[\s>]/i.test(sectionHtml);
+  const hasInputTag = /<(input|textarea|select)[\s>]/i.test(sectionHtml);
+  const hasContactWords =
+    lower.includes("contact") ||
+    lower.includes("get in touch") ||
+    lower.includes("message us") ||
+    lower.includes("send message") ||
+    lower.includes("email address");
+
+  const hasPricingWords =
+    lower.includes("pricing") ||
+    lower.includes("plan") ||
+    lower.includes("lifetime") ||
+    /\$\s*\d/.test(sectionHtml);
+
+  const hasHeroHeading = /<h1[\s>]/i.test(sectionHtml);
+  const hasList =
+    /<(ul|ol)[\s>]/i.test(sectionHtml) || /<li[\s>]/i.test(sectionHtml);
+
+  // CONTACT sanity check
+  if (mt === "contact_form" || updated.type === "contact") {
+    if (!(hasFormTag || hasInputTag || hasContactWords)) {
+      log(
+        `Section ${sectionId}: overriding contact_form -> feature_grid (no form/contact cues found)`
+      );
+      updated.type = hasList ? "feature_grid" : "generic";
+      updated.builder = updated.builder || {};
+      updated.builder.divi = updated.builder.divi || {};
+      updated.builder.divi.module_type = hasList ? "feature_grid" : "code";
+    }
+  }
+
+  // PRICING sanity check
+  if (mt === "pricing_table" || updated.type === "pricing") {
+    if (!hasPricingWords) {
+      log(
+        `Section ${sectionId}: overriding pricing_table -> generic (no pricing cues found)`
+      );
+      updated.type = "generic";
+      updated.builder = updated.builder || {};
+      updated.builder.divi = updated.builder.divi || {};
+      updated.builder.divi.module_type = "code";
+    }
+  }
+
+  // HERO sanity check
+  if (mt === "hero" || updated.type === "hero") {
+    if (!hasHeroHeading) {
+      log(
+        `Section ${sectionId}: overriding hero -> generic (no <h1> heading found)`
+      );
+      updated.type = "generic";
+      updated.builder = updated.builder || {};
+      updated.builder.divi = updated.builder.divi || {};
+      updated.builder.divi.module_type = "code";
+    }
+  }
+
+  return updated;
 }
 
 /**
@@ -314,7 +382,7 @@ async function main() {
       builder: {},
     });
   } else {
-    // Divi (or other future builders): classify each section individually
+    // Divi (or future builders): classify each section individually
     if (!appInfo.sections || appInfo.sections.length === 0) {
       console.warn(
         "[GLB Worker] No sections found; falling back to one root section."
@@ -330,37 +398,42 @@ async function main() {
         builder: {},
       });
     } else {
-      appInfo.sections.forEach((html, idx) => {
+      appInfo.sections.forEach((rawHtml, idx) => {
         const sectionId = `section-${idx + 1}`;
         const cls = `glb-section glb-section-${sectionId} glb-type-generic`;
 
-        const context = [
-          `framework=${appInfo.framework}`,
-          `index=${idx}`,
-          `pageTitle=${pageTitle}`,
-          `slug=${slug}`,
-        ].join("; ");
-
-        const classification = classifySection(html, context);
+        const classification = classifySection(rawHtml, appInfo, idx, pageTitle);
         let type = "generic";
         let builderMap = {};
-        let moduleType = "unknown";
-        let source = "none";
+
+        let html = rawHtml;
 
         if (classification && typeof classification === "object") {
-          type = classification.type || "generic";
-          builderMap = classification.builder || {};
-          source = classification.source || "unknown";
+          // Use LLM-provided normalized HTML if present
           if (
-            builderMap &&
-            builderMap.divi &&
-            typeof builderMap.divi.module_type === "string"
+            typeof classification.normalized_html === "string" &&
+            classification.normalized_html.trim().length > 0
           ) {
-            moduleType = builderMap.divi.module_type;
+            html = classification.normalized_html;
           }
+
+          const adjusted = applyHeuristicOverrides(
+            html,
+            classification,
+            sectionId
+          );
+
+          type = adjusted.type || "generic";
+          builderMap = adjusted.builder || {};
+
+          const diviModule = builderMap.divi && builderMap.divi.module_type;
+          const snippet = html.replace(/\s+/g, " ").slice(0, 160);
+          log(
+            `Section ${sectionId}: type=${type}, divi.module_type=${diviModule || "n/a"}, snippet="${snippet}"`
+          );
         } else {
           console.warn(
-            "[GLB Worker] classifier returned null; using generic/code."
+            `[GLB Worker] classifier returned null; using generic/code for ${sectionId}.`
           );
           builderMap = {
             divi: {
@@ -368,18 +441,7 @@ async function main() {
               params: {},
             },
           };
-          moduleType = "code";
-          source = "fallback";
         }
-
-        const previewSnippet = html
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 160);
-
-        log(
-          `Section ${sectionId}: type=${type}, divi.module_type=${moduleType}, source=${source}, snippet="${previewSnippet}"`
-        );
 
         layout.sections.push({
           id: sectionId,
