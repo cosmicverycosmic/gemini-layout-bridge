@@ -3,433 +3,497 @@
 /**
  * Gemini Layout Worker
  *
- * Responsibilities:
- *  - Inspect the React/Angular app folder (from Gemini ZIP)
- *  - Build a "section map" from TSX components (Hero, Services, Pricing, etc.)
- *  - Call the Python LLM classifier to pick appropriate Divi modules + params
- *  - Build a layout JSON with:
- *      sections: [{ id, class, type, html, builder: { divi: { module_type, params } } }]
- *  - POST that layout JSON back to WordPress via the callback URL
- *
- * IMPORTANT CHANGES:
- *  - NO MORE "Divi Implementation Guide" synthetic overlay.
- *  - We now create one section per TSX component (skipping any file that looks like a Divi guide).
- *  - Even if the LLM fails, you get one Divi Code module per TSX section (not a single root module).
+ * - Detects React (TSX) vs Angular (HTML) Gemini apps
+ * - Extracts sections (TSX components or <section> blocks)
+ * - Classifies each section via TinyLlama (llm_classifier.py)
+ * - Builds a layout JSON and POSTs it back to WordPress.
  */
 
-const fs = require("fs");
-const path = require("path");
-const { spawnSync } = require("child_process");
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
 
-// Use node-fetch v2 style if present, otherwise basic https
-let fetch;
-try {
-  // eslint-disable-next-line global-require
-  fetch = require("node-fetch");
-} catch (e) {
-  fetch = null;
-  // We'll fall back to https if needed
+// Node 18+ has global fetch; for safety, require('node-fetch') if needed.
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  fetchFn = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 }
-const https = require("https");
 
-function parseArgs(argv) {
-  const args = {};
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const val = argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[++i] : "";
-      args[key] = val;
-    }
+/* ========== CLI ARG PARSING ========== */
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const out = {
+    jobId: null,
+    jobSecret: null,
+    builder: 'divi',
+    appDir: './app',
+    callbackUrl: null,
+    pageTitle: '',
+    slug: ''
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--job-id') out.jobId = args[++i];
+    else if (a === '--job-secret') out.jobSecret = args[++i];
+    else if (a === '--builder') out.builder = args[++i];
+    else if (a === '--app-dir') out.appDir = args[++i];
+    else if (a === '--callback-url') out.callbackUrl = args[++i];
+    else if (a === '--page-title') out.pageTitle = args[++i];
+    else if (a === '--slug') out.slug = args[++i];
   }
-  return args;
+
+  if (!out.jobId || !out.jobSecret || !out.appDir || !out.callbackUrl) {
+    console.error('[GLB Worker] Missing one or more required arguments: --job-id, --job-secret, --app-dir, --callback-url');
+    process.exit(1);
+  }
+
+  return out;
 }
 
-function log(...msg) {
-  console.log("[GLB Worker]", ...msg);
+/* ========== UTILITIES ========== */
+
+function readFileIfExists(p) {
+  try {
+    if (fs.existsSync(p)) {
+      return fs.readFileSync(p, 'utf8');
+    }
+  } catch (err) {
+    console.warn('[GLB Worker] Failed to read file:', p, err.message);
+  }
+  return null;
 }
 
-/**
- * Recursively find all .tsx files under a directory.
- */
-function findTsxFiles(rootDir) {
-  const result = [];
-  function walk(dir) {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+function listFilesRecursive(dir, filterFn) {
+  const out = [];
+  function walk(d) {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch (e) {
+      return;
+    }
     for (const ent of entries) {
-      const full = path.join(dir, ent.name);
+      const full = path.join(d, ent.name);
       if (ent.isDirectory()) {
         walk(full);
-      } else if (ent.isFile() && full.toLowerCase().endsWith(".tsx")) {
-        result.push(full);
+      } else if (!filterFn || filterFn(full)) {
+        out.push(full);
       }
     }
   }
-  walk(rootDir);
-  return result;
+  walk(dir);
+  return out;
 }
 
-/**
- * Very rough text extraction from TSX/JSX:
- *  - Strip JSX tags
- *  - Strip JS expressions { } and template literals
- *  - Collapse whitespace
- */
-function extractTextFromTsx(source) {
-  let s = source;
+function stripHtml(html) {
+  if (!html) return '';
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  // Remove block comments
-  s = s.replace(/\/\*[\s\S]*?\*\//g, " ");
-  // Remove line comments
-  s = s.replace(/\/\/[^\n\r]*/g, " ");
+function stripTsxToText(src) {
+  if (!src) return '';
+  let s = src;
+
+  // Remove imports/exports
+  s = s.replace(/^\s*import[\s\S]*?;$/gm, '');
+  s = s.replace(/^\s*export[\s\S]*?$/gm, '');
+
+  // Remove comments
+  s = s.replace(/\/\/[^\n]*\n/g, '\n');
+  s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // Remove JS/TS blocks in {}
+  s = s.replace(/\{[^{}]*\}/g, ' ');
+
   // Remove JSX tags
-  s = s.replace(/<\/?[\w\d\-\.:]+[^>]*>/g, " ");
-  // Remove { ... } expressions
-  s = s.replace(/\{[^}]*\}/g, " ");
-  // Collapse whitespace
-  s = s.replace(/\s+/g, " ").trim();
+  s = s.replace(/<[^>]+>/g, ' ');
 
-  return s;
+  // Normalize whitespace
+  s = s.replace(/\s+/g, ' ');
+
+  return s.trim();
 }
 
-function inferSectionTypeFromName(name) {
-  const low = name.toLowerCase();
-  if (low.includes("hero") || low.includes("header")) return "hero";
-  if (low.includes("about")) return "about";
-  if (low.includes("service")) return "services";
-  if (low.includes("pricing") || low.includes("plans")) return "pricing";
-  if (low.includes("faq")) return "faq";
-  if (low.includes("testimonials") || low.includes("testimonial")) return "testimonials";
-  if (low.includes("contact") || low.includes("form")) return "contact";
-  if (low.includes("map") || low.includes("region")) return "map";
-  if (low.includes("process") || low.includes("steps") || low.includes("checklist")) return "process";
-  return "generic";
-}
+/* ========== LLM CLASSIFIER BRIDGE ========== */
 
-/**
- * Decide whether a TSX file is clearly just a Divi implementation guide
- * (we do NOT want that as a content section).
- */
-function looksLikeDiviGuide(source) {
-  const low = source.toLowerCase();
-  if (low.includes("divi implementation guide")) return true;
-  if (low.includes("follow these steps to build") && low.includes("divi")) return true;
-  if (low.includes("theme builder layouts") && low.includes("global header") && low.includes("global footer")) {
-    return true;
+function guessDiviMetaFromHeuristics(text, idOrName) {
+  const t = (text || '').toLowerCase();
+  const id = (idOrName || '').toLowerCase();
+
+  function contains(...words) {
+    return words.some(w => t.includes(w) || id.includes(w));
   }
-  return false;
+
+  // Very rough heuristics
+  if (contains('hero', 'welcome', 'above the fold', 'landing', 'headline')) {
+    return {
+      module_type: 'fullwidth_header',
+      params: {}
+    };
+  }
+
+  if (contains('price', 'pricing', 'plan', 'tier')) {
+    return {
+      module_type: 'pricing_tables',
+      params: {}
+    };
+  }
+
+  if (contains('faq', 'question', 'answer')) {
+    return {
+      module_type: 'faq_accordion',
+      params: {}
+    };
+  }
+
+  if (contains('testimonial', 'what our clients say', 'review')) {
+    return {
+      module_type: 'testimonials_slider',
+      params: {}
+    };
+  }
+
+  if (contains('contact', 'get in touch', 'reach us', 'email', 'phone')) {
+    return {
+      module_type: 'contact_form',
+      params: {}
+    };
+  }
+
+  if (contains('service', 'features', 'what we do', 'solutions')) {
+    return {
+      module_type: 'blurb_grid',
+      params: {}
+    };
+  }
+
+  return {
+    module_type: 'code',
+    params: {}
+  };
 }
 
-/**
- * Build raw section list from the app directory based purely on TSX components.
- * Each section:
- *  - id: kebab-case from filename
- *  - type: inferred from filename
- *  - html: a TSX snippet (to be used as code-module content or for reference)
- *  - text: extracted plain text (for the LLM to reason about)
- */
-function analyzeAppToSections(appDir) {
-  const tsxFiles = findTsxFiles(appDir);
+function classifyWithLLM(snippet, idOrName) {
+  const text = (snippet || '').trim();
+  const heuristics = guessDiviMetaFromHeuristics(text, idOrName);
 
-  if (!tsxFiles.length) {
-    log("No TSX files found in app dir, returning single generic section.");
-    return [
-      {
-        id: "root",
-        type: "generic",
-        html: "<div id=\"root\"></div>",
-        text: "",
-      },
-    ];
+  // Allow disabling LLM for debugging
+  if (!text || process.env.GLB_LLM_ENABLED === '0') {
+    return {
+      type: 'generic',
+      builder: {
+        divi: heuristics
+      }
+    };
   }
+
+  const maxInput = 1800;
+  const clipped = text.length > maxInput ? text.slice(0, maxInput) : text;
+
+  const payload = JSON.stringify({
+    snippet: clipped,
+    heuristics
+  });
+
+  try {
+    const res = spawnSync('python', ['scripts/llm_classifier.py'], {
+      input: payload,
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024
+    });
+
+    if (res.error) {
+      console.warn('[LLM] spawn error:', res.error.message);
+      return {
+        type: 'generic',
+        builder: { divi: heuristics }
+      };
+    }
+
+    const stdout = (res.stdout || '').trim();
+    if (!stdout) {
+      console.warn('[LLM] empty stdout, using heuristics only');
+      return {
+        type: 'generic',
+        builder: { divi: heuristics }
+      };
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch (e) {
+      console.warn('[LLM] JSON parse error, stdout was:', stdout);
+      return {
+        type: 'generic',
+        builder: { divi: heuristics }
+      };
+    }
+
+    const type = parsed.type || 'generic';
+    let builder = parsed.builder || {};
+    if (!builder.divi) {
+      builder.divi = heuristics;
+    }
+
+    return { type, builder };
+  } catch (err) {
+    console.warn('[LLM] classifier failed:', err.message);
+    return {
+      type: 'generic',
+      builder: { divi: heuristics }
+    };
+  }
+}
+
+/* ========== HEAD / BODY EXTRACTION ========== */
+
+function extractHeadAndBody(appDir) {
+  const indexPath = path.join(appDir, 'index.html');
+  const raw = readFileIfExists(indexPath);
+  if (!raw) {
+    return { headHtml: '', bodyClass: '' };
+  }
+
+  let headHtml = '';
+  let bodyClass = '';
+  try {
+    const headMatch = raw.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+    if (headMatch) {
+      const headInner = headMatch[1];
+      // Keep Tailwind + fonts, drop bundler scripts
+      const filtered = headInner
+        .split('\n')
+        .filter(line => {
+          if (line.includes('type="module"')) return false;
+          if (line.includes('main.js')) return false;
+          if (line.includes('index.tsx')) return false;
+          return true;
+        })
+        .join('\n');
+      headHtml = filtered.trim();
+    }
+
+    const bodyTagMatch = raw.match(/<body([^>]*)>([\s\S]*?)<\/body>/i);
+    if (bodyTagMatch) {
+      const bodyAttrs = bodyTagMatch[1] || '';
+      const classMatch = bodyAttrs.match(/class="([^"]*)"/i);
+      if (classMatch) {
+        bodyClass = classMatch[1];
+      }
+    }
+  } catch (err) {
+    console.warn('[GLB Worker] Failed to parse head/body:', err.message);
+  }
+
+  return { headHtml, bodyClass };
+}
+
+function getRootHtmlFromIndex(appDir) {
+  const indexPath = path.join(appDir, 'index.html');
+  const raw = readFileIfExists(indexPath);
+  if (!raw) return '<div id="root"></div>';
+
+  const bodyMatch = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  if (!bodyMatch) return '<div id="root"></div>';
+
+  let bodyInner = bodyMatch[1] || '';
+  // Drop scripts
+  bodyInner = bodyInner.replace(/<script[\s\S]*?<\/script>/gi, '');
+  return bodyInner.trim() || '<div id="root"></div>';
+}
+
+/* ========== ANGULAR HELPERS ========== */
+
+function splitAngularTemplateIntoSections(templateHtml) {
+  if (!templateHtml) return [];
 
   const sections = [];
-
-  for (const filePath of tsxFiles) {
-    const basename = path.basename(filePath, ".tsx");
-    const rawSource = fs.readFileSync(filePath, "utf8");
-
-    // Skip obvious Divi implementation guide components
-    if (looksLikeDiviGuide(rawSource)) {
-      log("Skipping Divi guide-like component:", basename);
-      continue;
-    }
-
-    // Skip index.tsx (ReactDOM render bootstrap)
-    if (basename.toLowerCase() === "index") {
-      continue;
-    }
-
-    const id = basename
-      .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
-      .replace(/[\s_]+/g, "-")
-      .toLowerCase();
-
-    const type = inferSectionTypeFromName(basename);
-    const text = extractTextFromTsx(rawSource);
-    const htmlSnippet = rawSource.slice(0, 4000);
-
-    sections.push({
-      id,
-      type,
-      html: htmlSnippet,
-      text,
-      sourcePath: filePath,
-    });
+  const regex = /<section\b[^>]*>[\s\S]*?<\/section>/gi;
+  let match;
+  while ((match = regex.exec(templateHtml)) !== null) {
+    sections.push(match[0]);
   }
 
   if (!sections.length) {
-    log("All TSX files looked like guides or boilerplate; falling back to root section.");
-    return [
-      {
-        id: "root",
-        type: "generic",
-        html: "<div id=\"root\"></div>",
-        text: "",
-      },
-    ];
+    // No explicit <section>; treat full template as one.
+    sections.push(templateHtml);
   }
-
-  log(`Found ${sections.length} content sections from TSX files.`);
   return sections;
 }
 
-/**
- * Call the Python classifier.
- * If it fails for ANY reason, return null (we'll fall back to "code" modules).
- */
-function classifyWithLLM(sectionMap) {
-  // Prepare JSON input
-  const input = {
-    sections: sectionMap.map((sec) => ({
-      id: sec.id,
-      type: sec.type,
-      html: sec.html,
-      text: sec.text,
-    })),
-  };
+/* ========== MAIN ANALYSIS ========== */
 
-  const proc = spawnSync("python", ["scripts/llm_classifier.py"], {
-    encoding: "utf8",
-    input: JSON.stringify(input),
-    maxBuffer: 10 * 1024 * 1024,
-  });
+async function analyzeAppToSections(appDir, builder) {
+  console.log('[GLB Worker] Analyzing app at', appDir);
 
-  if (proc.error) {
-    console.error("[LLM] classifier spawn error:", proc.error);
-    return null;
+  const angularJsonPath = path.join(appDir, 'angular.json');
+  const angularComponentPath = path.join(appDir, 'src', 'app.component.html');
+  const isAngularApp =
+    fs.existsSync(angularJsonPath) || fs.existsSync(angularComponentPath);
+
+  let angularTemplateHtml = null;
+  if (isAngularApp && fs.existsSync(angularComponentPath)) {
+    angularTemplateHtml = readFileIfExists(angularComponentPath);
+    console.log('[GLB Worker] Detected Angular app; app.component.html found.');
   }
 
-  if (proc.status !== 0) {
-    console.error("[LLM] classifier failed:", proc.stderr || proc.stdout);
-    return null;
-  }
+  // Gather TSX files for React-style apps
+  const tsxFiles = listFilesRecursive(appDir, f => f.endsWith('.tsx'));
 
-  const stdout = proc.stdout.trim();
-  if (!stdout) {
-    console.error("[LLM] classifier returned empty output");
-    return null;
-  }
+  // Filter out index.tsx (bootstrapping only)
+  const sectionTsxFiles = tsxFiles.filter(f => path.basename(f).toLowerCase() !== 'index.tsx');
 
-  try {
-    const result = JSON.parse(stdout);
-    if (!result || !Array.isArray(result.sections)) {
-      console.error("[LLM] classifier output missing sections");
-      return null;
+  const sections = [];
+
+  // React-style components
+  if (sectionTsxFiles.length) {
+    console.log('[GLB Worker] Found TSX section files:', sectionTsxFiles);
+    for (const file of sectionTsxFiles) {
+      const src = readFileIfExists(file);
+      if (!src) continue;
+
+      const shortName = path.basename(file, path.extname(file));
+      const snippet = stripTsxToText(src);
+      const classification = classifyWithLLM(snippet, shortName);
+
+      const type = classification.type || 'generic';
+      const builderMap = classification.builder || {};
+
+      // For safety, keep divi mapping under builder.divi
+      const diviMeta = builderMap.divi || guessDiviMetaFromHeuristics(snippet, shortName);
+
+      // For now, html = placeholder root div; in a more advanced version,
+      // you would run SSR with Vite/React. Here we expect Classic/Divi
+      // to primarily rely on builder metadata to construct modules.
+      sections.push({
+        id: shortName,
+        class: '',
+        html: `<div id="${shortName.toLowerCase()}-root"></div>`,
+        type,
+        builder: {
+          divi: diviMeta
+        }
+      });
     }
-    return result;
-  } catch (e) {
-    console.error("[LLM] classifier JSON parse error:", e);
-    console.error("Raw output:", stdout.slice(0, 2000));
-    return null;
   }
-}
 
-/**
- * Build final layout JSON:
- *  - Merge LLM classification (if available) into `builder.divi`
- *  - Keep original `html` from TSX snippets (for code module fallback)
- *  - Set simple body class; head_html left empty for now
- */
-function buildLayoutJson(sectionMap, classifierResult, builder) {
-  const sectionsOut = [];
+  // If no TSX sections, but Angular template exists → use Angular HTML as real content.
+  if (!sectionTsxFiles.length && isAngularApp && angularTemplateHtml) {
+    console.log('[GLB Worker] No TSX sections; using Angular app.component.html content.');
 
-  for (const sec of sectionMap) {
-    const base = {
-      id: sec.id,
-      class: "",
-      type: sec.type || "generic",
-      html: sec.html || "",
-      builder: {},
-    };
+    const angularSections = splitAngularTemplateIntoSections(angularTemplateHtml);
+    let index = 0;
+    for (const html of angularSections) {
+      index++;
 
-    if (classifierResult && Array.isArray(classifierResult.sections)) {
-      const match =
-        classifierResult.sections.find((s) => s.id === sec.id) ||
-        classifierResult.sections[sectionMap.indexOf(sec)] ||
-        null;
+      const idMatch = html.match(/id="([^"]+)"/i);
+      const id = idMatch ? idMatch[1] : `section-${index}`;
 
-      if (match && match.divi && typeof match.divi === "object") {
-        base.builder.divi = {
-          module_type: match.divi.module_type || "code",
-          params: match.divi.params || {},
-        };
+      const textSnippet = stripHtml(html);
+      const classification = classifyWithLLM(textSnippet, id);
+
+      const type = classification.type || 'generic';
+      const builderMap = classification.builder || {};
+      const diviMeta = builderMap.divi || guessDiviMetaFromHeuristics(textSnippet, id);
+
+      sections.push({
+        id,
+        class: '',
+        html,
+        type,
+        builder: {
+          divi: diviMeta
+        }
+      });
+    }
+  }
+
+  // Fallback: if we still have nothing, use index.html body as one "root" section.
+  if (!sections.length) {
+    console.log('[GLB Worker] No sections discovered; falling back to index.html body.');
+    const rootHtml = getRootHtmlFromIndex(appDir);
+    sections.push({
+      id: 'root',
+      class: 'glb-section glb-section-root glb-type-generic',
+      html: rootHtml,
+      type: 'generic',
+      builder: {
+        divi: { module_type: 'code', params: {} }
       }
-    }
-
-    // If no LLM mapping, we still want a code module per section,
-    // so Classic/Divi can at least show each TSX chunk separately.
-    if (!base.builder.divi) {
-      base.builder.divi = {
-        module_type: "code",
-        params: {
-          html_summary: sec.text || "",
-        },
-      };
-    }
-
-    sectionsOut.push(base);
+    });
   }
 
-  const bodyClass =
-    builder === "divi"
-      ? "gemini-layout gemini-layout-divi"
-      : "gemini-layout gemini-layout-classic";
-
-  return {
-    head_html: "",
-    body_class: bodyClass,
-    sections: sectionsOut,
-  };
+  return sections;
 }
 
-/**
- * POST layout JSON back to WordPress.
- */
-async function postLayout(callbackUrl, jobId, jobSecret, layout) {
+/* ========== CALLBACK TO WORDPRESS ========== */
+
+async function postLayoutToWordPress(callbackUrl, jobId, jobSecret, layout) {
+  console.log('[GLB Worker] Posting layout back to WordPress callback …');
+
   const payload = {
     job_id: jobId,
     secret: jobSecret,
-    layout,
+    layout
   };
 
-  const body = JSON.stringify(payload);
-
-  if (fetch) {
-    const res = await fetch(callbackUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(
-        `Callback HTTP ${res.status}: ${text.slice(0, 2000)}`
-      );
-    }
-    return text;
-  }
-
-  // Fallback: basic https
-  return new Promise((resolve, reject) => {
-    try {
-      const url = new URL(callbackUrl);
-      const opts = {
-        method: "POST",
-        hostname: url.hostname,
-        port: url.port || 443,
-        path: url.pathname + url.search,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      };
-
-      const req = https.request(opts, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(
-              new Error(
-                `Callback HTTP ${res.statusCode}: ${data.slice(0, 2000)}`
-              )
-            );
-          } else {
-            resolve(data);
-          }
-        });
-      });
-
-      req.on("error", reject);
-      req.write(body);
-      req.end();
-    } catch (err) {
-      reject(err);
-    }
+  const res = await fetchFn(callbackUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
   });
+
+  const status = res.status;
+  let text = '';
+  try {
+    text = await res.text();
+  } catch (err) {
+    text = '';
+  }
+
+  console.log('[GLB Worker] WP callback status:', status);
+  if (text) {
+    console.log('[GLB Worker] WP callback response body:', text);
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new Error('WordPress callback returned HTTP ' + status);
+  }
 }
 
-async function main() {
-  const args = parseArgs(process.argv);
+/* ========== MAIN ========== */
 
-  const jobId = args["job-id"] || "";
-  const jobSecret = args["job-secret"] || "";
-  const builder = args["builder"] || "divi";
-  const appDir = args["app-dir"] || "./app";
-  const callbackUrl = args["callback-url"] || "";
-  const pageTitle = args["page-title"] || "";
-  const slug = args["slug"] || "";
+(async () => {
+  const args = parseArgs();
+  console.log(
+    `[GLB Worker] Starting job ${args.jobId}, builder=${args.builder}, appDir=${args.appDir}`
+  );
 
-  if (!jobId || !jobSecret || !callbackUrl) {
-    console.error(
-      "Missing required arguments: --job-id, --job-secret, --callback-url"
-    );
-    process.exit(1);
-  }
+  const { headHtml, bodyClass } = extractHeadAndBody(args.appDir);
+  const sections = await analyzeAppToSections(args.appDir, args.builder);
 
-  log(`Starting job ${jobId}, builder=${builder}`);
-
-  if (!fs.existsSync(appDir) || !fs.statSync(appDir).isDirectory()) {
-    console.error("App directory does not exist:", appDir);
-    process.exit(1);
-  }
-
-  // 1) Build section map from TSX components
-  const sectionMap = analyzeAppToSections(appDir);
-
-  // 2) Ask the on-repo LLM for module classification
-  const classifierResult = classifyWithLLM(sectionMap);
-  if (!classifierResult) {
-    log("LLM classification failed or produced invalid output; falling back to code modules per section.");
-  }
-
-  // 3) Build final layout JSON
-  const layout = buildLayoutJson(sectionMap, classifierResult, builder);
-
-  // 4) Attach page meta in the layout object (optional, but WP plugin can ignore or use it)
-  layout.meta = {
-    page_title: pageTitle,
-    slug,
-    builder,
+  const layout = {
+    head_html: headHtml,
+    body_class: bodyClass,
+    sections
   };
 
-  // 5) POST layout to WordPress
   try {
-    log("Posting layout back to WordPress callback …");
-    const resText = await postLayout(callbackUrl, jobId, jobSecret, layout);
-    log("Done.");
-    // For debugging:
-    // console.log("WP response:", resText.slice(0, 2000));
+    await postLayoutToWordPress(args.callbackUrl, args.jobId, args.jobSecret, layout);
+    console.log('[GLB Worker] Done.');
   } catch (err) {
-    console.error("Failed to POST layout to WordPress:", err);
+    console.error('[GLB Worker] Error posting layout to WordPress:', err.message);
     process.exit(1);
   }
-}
-
-main().catch((err) => {
-  console.error("Unhandled error in generate-layout:", err);
-  process.exit(1);
-});
+})();
