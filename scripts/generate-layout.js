@@ -16,7 +16,7 @@ function parseArgs() {
   for (let i = 0; i < args.length; i += 2) {
     const key = args[i];
     const val = args[i + 1];
-    if (!key || !val) continue;
+    if (!key || typeof val === "undefined") continue;
     if (key.startsWith("--")) {
       out[key.slice(2)] = val;
     }
@@ -106,19 +106,17 @@ function analyzeApp(appDir) {
 
   if (tsxFiles.length > 0) {
     log("Detected React/TSX app; TSX files found.");
-    // For now, treat the main visual app as the concatenation of all TSX
-    // rendered fragments. This is heuristic but works better than nothing.
     let combinedHtml = "";
     for (const f of tsxFiles) {
       const src = fs.readFileSync(f, "utf8");
-      // Very naive extraction: look for JSX fragments containing <section or <main
+      // Very naive extraction: look for JSX fragments containing <section or <main>
       const match = src.match(/(<(section|main)[\s\S]*?<\/(section|main)>)/i);
       if (match) {
         combinedHtml += "\n" + match[1] + "\n";
       }
     }
     if (!combinedHtml.trim()) {
-      // If we couldn't find subsections, just fall back to a root div
+      // If nothing obvious, just fall back to a root div
       combinedHtml = '<div id="root"></div>';
     }
     const sections = splitHtmlIntoSections(combinedHtml);
@@ -132,6 +130,7 @@ function analyzeApp(appDir) {
   // Fallback: try index.html
   const indexHtml = path.join(appDir, "index.html");
   if (fs.existsSync(indexHtml)) {
+    log("Detected static index.html app.");
     const full = fs.readFileSync(indexHtml, "utf8");
     const sections = splitHtmlIntoSections(full);
     return {
@@ -142,7 +141,7 @@ function analyzeApp(appDir) {
   }
 
   // As a last resort, create a trivial root section.
-  log("No Angular or TSX or index.html found; using trivial root section.");
+  log("No Angular, TSX, or index.html found; using trivial root section.");
   const trivialHtml = '<div id="root"></div>';
   return {
     framework: "unknown",
@@ -153,23 +152,21 @@ function analyzeApp(appDir) {
 
 /**
  * Call the Python classifier for a single section HTML snippet.
- * We send a JSON payload on stdin to avoid escaping issues.
+ * We send raw HTML on stdin; Python prints ONE JSON object on stdout.
  */
 function classifySection(sectionHtml, context) {
-  const payload = {
-    html: sectionHtml,
-    context: context || "",
-  };
-
   const env = { ...process.env };
-  // Make sure the model env variable is passed through.
-  // Default has been changed in the Python script itself.
+
+  // Pass context as a hint to the classifier, if we want to use it later.
+  env.GLB_SECTION_CONTEXT = context || "";
+
+  // Default to a stronger model if none is set.
   if (!env.GLB_LLM_MODEL) {
     env.GLB_LLM_MODEL = "microsoft/Phi-3-mini-4k-instruct";
   }
 
   const res = spawnSync("python", ["scripts/llm_classifier.py"], {
-    input: JSON.stringify(payload),
+    input: sectionHtml,
     encoding: "utf8",
     env,
   });
@@ -181,7 +178,8 @@ function classifySection(sectionHtml, context) {
 
   if (res.status !== 0) {
     console.error("[LLM] classifier non-zero exit:", res.status);
-    console.error(res.stderr || res.stdout);
+    if (res.stderr) console.error(res.stderr);
+    else if (res.stdout) console.error(res.stdout);
     return null;
   }
 
@@ -257,9 +255,7 @@ async function main() {
     process.exit(1);
   }
 
-  log(
-    `Starting job ${jobId}, builder=${builder}, appDir=${appDir}`
-  );
+  log(`Starting job ${jobId}, builder=${builder}, appDir=${appDir}`);
 
   // 1) Analyze the app structure & sections
   const appInfo = analyzeApp(appDir);
@@ -267,7 +263,7 @@ async function main() {
 
   // 2) Build layout object
   const layout = {
-    head_html: cssBundle, // injected into <head> by the WP plugin
+    head_html: cssBundle, // WP side can decide how to inject this into <head>
     body_class: "",
     sections: [],
   };
@@ -286,7 +282,7 @@ async function main() {
       builder: {},
     });
   } else {
-    // Divi (or other future builders): classify each section individually
+    // Divi (or future builders): classify each section individually
     if (!appInfo.sections || appInfo.sections.length === 0) {
       console.warn(
         "[GLB Worker] No sections found; falling back to one root section."
