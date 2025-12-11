@@ -163,6 +163,37 @@ def generate_json(tokenizer, model, prompt: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
+def build_fallback_layout(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If the LLM goes off the rails, fall back to a safe layout:
+    every section -> Divi 'code' module with an HTML summary.
+    """
+    sections_out = []
+    for idx, sec in enumerate(data.get("sections", [])):
+        sid = sec.get("id", f"sec{idx}")
+        s_type = sec.get("type", "generic")
+        html = sec.get("html", "") or ""
+        text_hint = sec.get("text", "") or ""
+
+        # Short summary so we don't blow up post size
+        summary = text_hint.strip() or html[:4000]
+
+        sections_out.append(
+            {
+                "id": sid,
+                "type": s_type,
+                "divi": {
+                    "module_type": "code",
+                    "params": {
+                        "html_summary": summary,
+                    },
+                },
+            }
+        )
+
+    return {"sections": sections_out}
+
+
 def main():
     raw = sys.stdin.read()
     if not raw.strip():
@@ -171,20 +202,20 @@ def main():
 
     data = json.loads(raw)
 
-    tokenizer, model = load_model()
-    prompt = build_prompt(data)
-
     try:
+        tokenizer, model = load_model()
+        prompt = build_prompt(data)
         result = generate_json(tokenizer, model, prompt)
+
+        if "sections" not in result or not isinstance(result["sections"], list):
+            raise RuntimeError("Result JSON missing 'sections' list.")
+
+        print(json.dumps(result))
     except Exception as e:
-        # Dump raw text to stderr to debug if needed
-        sys.stderr.write(f"[llm_classifier] Failed to parse JSON: {e}\n")
-        raise
-
-    if "sections" not in result or not isinstance(result["sections"], list):
-        raise RuntimeError("Result JSON missing 'sections' list.")
-
-    print(json.dumps(result))
+        # Log to stderr for GitHub Actions log visibility
+        sys.stderr.write(f"[llm_classifier] Falling back to code modules due to error: {e}\n")
+        fallback = build_fallback_layout(data)
+        print(json.dumps(fallback))
 
 
 if __name__ == "__main__":
