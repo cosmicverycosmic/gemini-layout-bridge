@@ -1,478 +1,383 @@
 #!/usr/bin/env node
-'use strict';
+/* eslint-disable no-console */
+const fs = require("fs");
+const fsp = fs.promises;
+const path = require("path");
+const { spawnSync } = require("child_process");
+const https = require("https");
+const http = require("http");
 
-const fs = require('fs');
-const path = require('path');
-const { execSync, spawnSync } = require('child_process');
-const axios = require('axios');
-const { JSDOM } = require('jsdom');
-
-let gCallbackUrl = '';
-let gJobId = '';
-let gJobSecret = '';
-
+/**
+ * Very small CLI arg parser (no external dep).
+ */
 function parseArgs(argv) {
-  const args = {};
-  for (let i = 0; i < argv.length; i++) {
+  const out = {};
+  for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg.startsWith('--')) {
-      const key = arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-      const value = argv[i + 1];
-      args[key] = value;
-      i++;
-    }
-  }
-  return args;
-}
-
-function runCommand(cwd, command) {
-  console.log(`Running: ${command} (cwd=${cwd})`);
-  execSync(command, { cwd, stdio: 'inherit' });
-}
-
-function findProjectDir(appDir) {
-  const pkg = path.join(appDir, 'package.json');
-  if (fs.existsSync(pkg)) {
-    return appDir;
-  }
-  const entries = fs.readdirSync(appDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = path.join(appDir, entry.name);
-    const pkgCandidate = path.join(candidate, 'package.json');
-    if (fs.existsSync(pkgCandidate)) {
-      return candidate;
-    }
-  }
-  throw new Error('Could not find package.json in appDir or its direct subdirectories.');
-}
-
-function findIndexHtmlUnder(dir) {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const loc = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const res = findIndexHtmlUnder(loc);
-      if (res) return res;
-    } else if (entry.isFile() && entry.name.toLowerCase() === 'index.html') {
-      return loc;
-    }
-  }
-  return null;
-}
-
-function findBuiltIndexHtml(projectDir) {
-  const candidates = [
-    path.join(projectDir, 'dist'),
-    path.join(projectDir, 'build')
-  ];
-
-  for (const base of candidates) {
-    if (!fs.existsSync(base) || !fs.statSync(base).isDirectory()) {
-      continue;
-    }
-    const indexPath = findIndexHtmlUnder(base);
-    if (indexPath) {
-      return indexPath;
-    }
-  }
-
-  throw new Error('Could not find dist/build index.html after npm run build.');
-}
-
-function isExternalUrl(url) {
-  if (!url) return false;
-  const trimmed = url.trim();
-  return /^https?:\/\//i.test(trimmed) || trimmed.startsWith('data:');
-}
-
-function resolveAssetPath(distRoot, url) {
-  let p = url.trim();
-  p = p.replace(/^\//, '');
-  p = p.replace(/^\.\//, '');
-  return path.join(distRoot, p);
-}
-
-function inlineHeadAssets(document, distRoot) {
-  const head = document.head || document.createElement('head');
-
-  // CSS: inline local stylesheets, keep external ones
-  const linkNodes = Array.from(document.querySelectorAll('link[rel="stylesheet"][href]'));
-  for (const link of linkNodes) {
-    const href = link.getAttribute('href');
-    if (!href) continue;
-
-    if (isExternalUrl(href)) {
-      if (link.parentNode !== head) {
-        head.appendChild(link.cloneNode(true));
-        link.parentNode.removeChild(link);
+    if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      const next = argv[i + 1];
+      if (!next || next.startsWith("--")) {
+        out[key] = true;
+      } else {
+        out[key] = next;
+        i++;
       }
-      continue;
     }
-
-    const assetPath = resolveAssetPath(distRoot, href);
-    if (!fs.existsExistsSyncSafe(assetPath)) {
-      console.warn(`CSS asset not found for href=${href} at ${assetPath}`);
-      continue;
-    }
-
-    const css = fs.readFileSync(assetPath, 'utf8');
-    const styleEl = document.createElement('style');
-    styleEl.textContent = css;
-    head.appendChild(styleEl);
-    link.parentNode.removeChild(link);
   }
-
-  // JS: inline local bundles, keep external ones
-  const scriptNodes = Array.from(document.querySelectorAll('script[src]'));
-  for (const script of scriptNodes) {
-    const src = script.getAttribute('src');
-    if (!src) continue;
-
-    if (isExternalUrl(src)) {
-      if (script.parentNode !== head) {
-        head.appendChild(script.cloneNode(true));
-        script.parentNode.removeChild(script);
-      }
-      continue;
-    }
-
-    const assetPath = resolveAssetPath(distRoot, src);
-    if (!fs.existsExistsSyncSafe(assetPath)) {
-      console.warn(`JS asset not found for src=${src} at ${assetPath}`);
-      continue;
-    }
-
-    const js = fs.readFileSync(assetPath, 'utf8');
-    const inlineScript = document.createElement('script');
-    const type = script.getAttribute('type');
-    if (type) {
-      inlineScript.setAttribute('type', type);
-    } else {
-      inlineScript.setAttribute('type', 'module');
-    }
-    if (script.hasAttribute('defer')) {
-      inlineScript.setAttribute('defer', 'defer');
-    }
-    inlineScript.textContent = js;
-    head.appendChild(inlineScript);
-    script.parentNode.removeChild(script);
-  }
-
-  return head.innerHTML;
+  return out;
 }
 
-// Helper: fs.existsSync but wrapped for try/catch
-fs.existsExistsSyncSafe = function (p) {
-  try {
-    return fs.existsSync(p);
-  } catch (e) {
-    return false;
-  }
-};
+const args = parseArgs(process.argv);
 
-function extractTextFromHtml(html) {
-  try {
-    const dom = new JSDOM(html);
-    const doc = dom.window.document;
-    return (doc.body && doc.body.textContent ? doc.body.textContent : '').replace(/\s+/g, ' ').trim();
-  } catch (e) {
-    return '';
+const JOB_ID = args["job-id"] || process.env.JOB_ID || "";
+const JOB_SECRET = args["job-secret"] || process.env.JOB_SECRET || "";
+const BUILDER = (args["builder"] || process.env.BUILDER || "divi").toLowerCase();
+const APP_DIR = args["app-dir"] || "./app";
+const CALLBACK_URL = args["callback-url"] || process.env.CALLBACK_URL || "";
+const PAGE_TITLE = args["page-title"] || process.env.PAGE_TITLE || "";
+const SLUG = args["slug"] || process.env.SLUG || "";
+
+/* ---------- Utility helpers ---------- */
+
+function slugify(str) {
+  return (str || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "section";
+}
+
+function guessTypeFromName(name) {
+  const lower = name.toLowerCase();
+  if (lower.includes("hero")) return "hero";
+  if (lower.includes("service")) return "services";
+  if (lower.includes("pricing") || lower.includes("plan")) return "pricing";
+  if (lower.includes("faq")) return "faq";
+  if (lower.includes("testimonials") || lower.includes("testimonial")) return "testimonials";
+  if (lower.includes("contact")) return "contact";
+  if (lower.includes("about")) return "about";
+  if (lower.includes("process")) return "process";
+  if (lower.includes("region") || lower.includes("map")) return "region";
+  return "generic";
+}
+
+function extractReturnJsx(src) {
+  // Very crude: look for "return (" and matching ");"
+  const idx = src.indexOf("return (");
+  if (idx === -1) return "";
+  const after = src.slice(idx + "return (".length);
+  let depth = 1;
+  let end = -1;
+  for (let i = 0; i < after.length; i++) {
+    const ch = after[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
   }
+  if (end === -1) return after;
+  return after.slice(0, end);
+}
+
+function tsxToStaticHtml(jsx) {
+  if (!jsx) return "";
+
+  let html = jsx;
+
+  // Remove React fragments
+  html = html.replace(/<React\.Fragment>/g, "").replace(/<\/React\.Fragment>/g, "");
+  html = html.replace(/<>/g, "").replace(/<\/>/g, "");
+
+  // Strip TS/JS comments
+  html = html.replace(/\/\*[\s\S]*?\*\//g, "");
+  html = html.replace(/\/\/[^\n]*/g, "");
+
+  // Replace className -> class
+  html = html.replace(/\bclassName=/g, "class=");
+
+  // Replace HTML-like self-closing React components (icons etc) with spans.
+  html = html.replace(
+    /<([A-Z][A-Za-z0-9_]*)((\s+[^>]*?)?)\/>/g,
+    (m, compName) =>
+      `<span class="glb-component-placeholder" data-component="${compName}"></span>`
+  );
+
+  // Remove JSX expression braces around simple strings: {"Text"} -> Text
+  html = html.replace(/\{\s*"([^"]*)"\s*\}/g, "$1");
+
+  // Kill obvious TSX type annotations inside tags, e.g. <div key={idx as number}>
+  html = html.replace(/\sas\s+[A-Za-z0-9_\[\]\|]+/g, "");
+
+  // JSX attributes like onClick, etc. – keep them as-is for now (mostly ignored by browser).
+  // You could strip them if you want purely static HTML.
+
+  return html.trim();
+}
+
+function extractTextHint(src) {
+  // Grab some lines with quoted strings – good enough for a hint.
+  const lines = src.split("\n");
+  const interesting = [];
+  for (const line of lines) {
+    if (/"[^"]+"/.test(line)) {
+      interesting.push(line.trim());
+    }
+    if (interesting.length >= 12) break;
+  }
+  return interesting.join(" ");
 }
 
 /**
- * Classic builder: everything in one block for maximum fidelity.
+ * Extract <head> (scripts, styles) and body classes from index.html if present.
  */
-function buildSectionsClassic(document) {
-  const body = document.body;
-  if (!body) {
-    throw new Error('No <body> element in built index.html.');
-  }
+async function extractHeadAndBody(appDir) {
+  const indexPath = path.join(appDir, "index.html");
+  let headHtml = "";
+  let bodyClass = "";
 
-  let rootElement =
-    body.querySelector('#root') ||
-    body.querySelector('app-root');
-
-  let html;
-  if (rootElement) {
-    html = rootElement.outerHTML;
-  } else {
-    html = body.innerHTML.trim();
-  }
-
-  return [
-    {
-      id: rootElement ? rootElement.id || '' : '',
-      class: rootElement ? (rootElement.getAttribute('class') || '') : '',
-      html: html,
-      type: 'app_root',
-      builder: {}
+  try {
+    const html = await fsp.readFile(indexPath, "utf8");
+    const headMatch = html.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+    if (headMatch) {
+      // Strip outer <head> wrapper, keep inner contents.
+      headHtml = headMatch[1].trim();
     }
-  ];
+    const bodyMatch = html.match(/<body([^>]*)>/i);
+    if (bodyMatch) {
+      const attr = bodyMatch[1] || "";
+      const classMatch = attr.match(/class\s*=\s*"([^"]*)"/i);
+      if (classMatch) {
+        bodyClass = classMatch[1].trim();
+      }
+    }
+  } catch (e) {
+    // no index.html – fine.
+  }
+
+  return { headHtml, bodyClass };
 }
 
 /**
- * Divi builder: split into semantic sections.
+ * Collect TSX sections from /components and root App.tsx as a fallback.
  */
-function buildSectionsDivi(document) {
-  const body = document.body;
-  if (!body) {
-    throw new Error('No <body> element in built index.html.');
-  }
-
-  let candidates = Array.from(body.querySelectorAll('section, main, header, footer'));
-
-  if (candidates.length === 0) {
-    candidates = Array.from(body.children || []);
-  }
-
-  if (candidates.length === 0) {
-    candidates = [body];
-  }
-
+async function collectSections(appDir) {
+  const componentsDir = path.join(appDir, "components");
   const sections = [];
-  const llmSections = [];
 
-  candidates.forEach((el, idx) => {
-    const id = el.id || '';
-    const className = el.getAttribute('class') || '';
-    const html = el.outerHTML;
-    const text = extractTextFromHtml(html).slice(0, 1000);
-    const snippet = html.slice(0, 1000);
+  async function addTsxFile(filePath) {
+    const src = await fsp.readFile(filePath, "utf8");
+    const name = path.basename(filePath, ".tsx");
+    const jsx = extractReturnJsx(src);
+    const htmlInner = tsxToStaticHtml(jsx);
+    if (!htmlInner) return;
 
-    let type = 'generic';
-    const lowerText = text.toLowerCase();
-    if (lowerText.includes('pricing') || lowerText.includes('plans') || lowerText.includes('per month')) {
-      type = 'pricing';
-    } else if (lowerText.includes('faq') || lowerText.includes('frequently asked questions')) {
-      type = 'faq';
-    } else if (lowerText.includes('contact') || lowerText.includes('get in touch')) {
-      type = 'contact';
-    } else if (lowerText.includes('testimonials') || lowerText.includes('what our clients say')) {
-      type = 'testimonials';
-    } else if (lowerText.includes('services')) {
-      type = 'services';
-    } else if (lowerText.includes('about')) {
-      type = 'about';
-    } else if (lowerText.includes('hero') || lowerText.includes('welcome') || lowerText.includes('we help')) {
-      type = 'hero';
-    }
+    const id = slugify(name);
+    const type = guessTypeFromName(name);
+    const textHint = extractTextHint(src);
+
+    // Wrap in a <section> for classic output & consistency.
+    const html = `<section id="${id}" class="glb-section glb-section-${id} glb-type-${type}">\n${htmlInner}\n</section>`;
 
     sections.push({
       id,
-      class: className,
+      name,
+      type,
       html,
-      type,
-      builder: {}
+      text: textHint,
     });
+  }
 
-    llmSections.push({
-      index: idx,
-      id,
-      classes: className,
-      type,
-      text,
-      htmlSnippet: snippet
-    });
-  });
+  if (fs.existsSync(componentsDir) && fs.statSync(componentsDir).isDirectory()) {
+    const files = await fsp.readdir(componentsDir);
+    for (const file of files) {
+      if (file.toLowerCase().endsWith(".tsx")) {
+        await addTsxFile(path.join(componentsDir, file));
+      }
+    }
+  }
 
-  return { sections, llmSections };
+  // Fallback: if no explicit components found, treat App.tsx as one big section.
+  if (sections.length === 0) {
+    const appTsx = path.join(appDir, "App.tsx");
+    if (fs.existsSync(appTsx)) {
+      await addTsxFile(appTsx);
+    }
+  }
+
+  return sections;
 }
 
 /**
- * Call on-repo LLM (Python + transformers) to classify Divi module types.
+ * Call the on-repo LLM classifier (llm_classifier.py) to get Divi mappings.
  */
-function classifySectionsWithLLM(llmSections, builder) {
-  if (!llmSections || llmSections.length === 0) {
-    return [];
-  }
-
-  console.log('Invoking local LLM classifier for sections...');
-
+function classifyWithLLM(sections) {
   const payload = {
-    builder,
-    sections: llmSections
+    sections: sections.map((s) => ({
+      id: s.id,
+      type: s.type,
+      text: s.text,
+      html: s.html,
+    })),
   };
 
-  const proc = spawnSync('python', ['scripts/llm_classifier.py'], {
+  const proc = spawnSync("python", ["scripts/llm_classifier.py"], {
     input: JSON.stringify(payload),
-    encoding: 'utf8',
-    maxBuffer: 10 * 1024 * 1024
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
   });
-
-  if (proc.error) {
-    console.error('Error running llm_classifier.py:', proc.error);
-    return [];
-  }
 
   if (proc.status !== 0) {
-    console.error('llm_classifier.py non-zero exit code:', proc.status);
-    console.error('stderr:', proc.stderr);
-    return [];
+    console.error("[LLM] classifier failed:", proc.stderr || proc.stdout);
+    throw new Error("LLM classifier failed");
   }
 
-  let result;
+  let data;
   try {
-    result = JSON.parse(proc.stdout);
+    data = JSON.parse(proc.stdout);
   } catch (e) {
-    console.error('Failed to parse LLM output as JSON:', e);
-    console.error('Raw output:', proc.stdout);
-    return [];
+    console.error("[LLM] JSON parse error:", e, proc.stdout);
+    throw e;
   }
 
-  if (!result || !Array.isArray(result.results)) {
-    console.error('LLM output missing results array.');
-    return [];
+  if (!data.sections || !Array.isArray(data.sections)) {
+    throw new Error("LLM result missing sections");
   }
 
-  return result.results;
+  // Merge back into our sections by id.
+  const byId = {};
+  for (const s of data.sections) {
+    if (!s || !s.id) continue;
+    byId[s.id] = s;
+  }
+
+  for (const s of sections) {
+    const mapped = byId[s.id];
+    if (mapped && mapped.divi) {
+      s.divi_meta = mapped.divi;
+    } else {
+      // If LLM didn't map it, fallback to code module.
+      s.divi_meta = {
+        module_type: "code",
+        params: {
+          html_summary: `Auto-fallback code module for section ${s.id}`,
+        },
+      };
+    }
+  }
+
+  return sections;
 }
 
-function extractLayoutFromBuiltIndex(indexPath, builder) {
-  const html = fs.readFileSync(indexPath, 'utf8');
-  const dom = new JSDOM(html);
-  const document = dom.window.document;
+/**
+ * POST layout JSON back to WP callback.
+ */
+function postToCallback(url, payload) {
+  return new Promise((resolve, reject) => {
+    if (!url) return reject(new Error("No callback URL provided"));
 
-  const distRoot = path.dirname(indexPath);
+    const data = JSON.stringify(payload);
+    const parsed = new URL(url);
+    const lib = parsed.protocol === "https:" ? https : http;
 
-  const headHtml = inlineHeadAssets(document, distRoot);
-  const bodyClass =
-    (document.body && document.body.getAttribute('class')) || '';
-
-  let sections = [];
-  let llmSections = [];
-
-  if (builder === 'divi') {
-    const built = buildSectionsDivi(document);
-    sections = built.sections;
-    llmSections = built.llmSections;
-  } else {
-    sections = buildSectionsClassic(document);
-    llmSections = [];
-  }
-
-  return { headHtml, bodyClass, sections, llmSections };
-}
-
-async function postError(message) {
-  if (!gCallbackUrl || !gJobId || !gJobSecret) {
-    console.error('Error:', message);
-    return;
-  }
-
-  try {
-    await axios.post(
-      gCallbackUrl,
-      {
-        job_id: gJobId,
-        secret: gJobSecret,
-        error: message
+    const options = {
+      method: "POST",
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: parsed.pathname + (parsed.search || ""),
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
       },
-      {
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
-  } catch (err) {
-    console.error('Failed to send error callback:', err.message || err);
-  }
+    };
+
+    const req = lib.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, body });
+        } else {
+          reject(
+            new Error(`Callback returned ${res.statusCode}: ${body || "no body"}`)
+          );
+        }
+      });
+    });
+
+    req.on("error", (err) => reject(err));
+    req.write(data);
+    req.end();
+  });
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+/* ---------- Main flow ---------- */
 
-  const jobId = args.jobId;
-  const jobSecret = args.jobSecret;
-  const builder = args.builder || 'divi';
-  const appDir = args.appDir || './app';
-  const callbackUrl = args.callbackUrl;
-  const pageTitle = args.pageTitle || '';
-  const slug = args.slug || '';
-
-  if (!jobId || !jobSecret || !callbackUrl) {
-    throw new Error('job-id, job-secret, and callback-url are required.');
-  }
-
-  gJobId = jobId;
-  gJobSecret = jobSecret;
-  gCallbackUrl = callbackUrl;
-
-  const projectDir = findProjectDir(appDir);
-
+(async () => {
   try {
-    runCommand(projectDir, 'npm ci');
-  } catch (e) {
-    console.warn('npm ci failed, falling back to npm install');
-    runCommand(projectDir, 'npm install');
-  }
+    if (!JOB_ID || !JOB_SECRET) {
+      throw new Error("JOB_ID and JOB_SECRET are required.");
+    }
 
-  runCommand(projectDir, 'npm run build');
+    console.log(`[GLB Worker] Starting job ${JOB_ID}, builder=${BUILDER}`);
 
-  const indexHtmlPath = findBuiltIndexHtml(projectDir);
-  console.log(`Using built index.html at: ${indexHtmlPath}`);
+    const { headHtml, bodyClass } = await extractHeadAndBody(APP_DIR);
+    const sections = await collectSections(APP_DIR);
 
-  const { headHtml, bodyClass, sections, llmSections } =
-    extractLayoutFromBuiltIndex(indexHtmlPath, builder);
+    if (!sections.length) {
+      throw new Error("No TSX sections found to process.");
+    }
 
-  let builderMetaByIndex = [];
+    // Use LLM to attach Divi module metadata.
+    classifyWithLLM(sections);
 
-  if (builder === 'divi' && llmSections.length > 0) {
-    builderMetaByIndex = classifySectionsWithLLM(llmSections, builder);
-  }
+    // Classic HTML – one coherent page: just join our section HTML.
+    const classicHtml = sections.map((s) => s.html).join("\n\n");
 
-  const builderMetaMap = {};
-  builderMetaByIndex.forEach((entry) => {
-    if (!entry || typeof entry.index !== 'number') return;
-    builderMetaMap[entry.index] = {
-      module_type: entry.module_type || 'code',
-      params: entry.params && typeof entry.params === 'object' ? entry.params : {}
+    const layout = {
+      head_html: headHtml || "",
+      body_class: bodyClass || "",
+      sections: sections.map((s) => ({
+        id: s.id,
+        class: `glb-section glb-section-${s.id} glb-type-${s.type}`,
+        html: s.html,
+        type: s.type,
+        builder: {
+          divi: s.divi_meta || null,
+        },
+      })),
+      // Extra convenience for future plugin updates; plugin can ignore this for now.
+      classic_html: classicHtml,
     };
-  });
 
-  const finalSections = sections.map((section, idx) => {
-    const builderMeta = builderMetaMap[idx] || {};
-    const modType = builderMeta.module_type || 'code';
-    const params = builderMeta.params || {};
-
-    const builderField =
-      builder === 'divi'
-        ? { divi: { module_type: modType, params } }
-        : {};
-
-    return {
-      id: section.id,
-      class: section.class,
-      html: section.html,
-      type: section.type,
-      builder: builderField
+    const payload = {
+      job_id: JOB_ID,
+      secret: JOB_SECRET,
+      layout,
+      error: null,
     };
-  });
 
-  const layout = {
-    head_html: headHtml,
-    body_class: bodyClass,
-    sections: finalSections
-  };
-
-  const payload = {
-    job_id: jobId,
-    secret: jobSecret,
-    layout: layout,
-    page_title: pageTitle,
-    slug: slug,
-    builder: builder
-  };
-
-  console.log('Posting layout back to WordPress callback...');
-  await axios.post(callbackUrl, payload, {
-    headers: { 'Content-Type': 'application/json' }
-  });
-
-  console.log('Done.');
-}
-
-main().catch(async (err) => {
-  console.error('Worker error:', err.message || err);
-  await postError(err.message || String(err));
-  process.exit(1);
-});
+    console.log("[GLB Worker] Posting layout back to WordPress callback …");
+    await postToCallback(CALLBACK_URL, payload);
+    console.log("[GLB Worker] Done.");
+  } catch (err) {
+    console.error("[GLB Worker] Error:", err);
+    if (CALLBACK_URL && JOB_ID && JOB_SECRET) {
+      try {
+        await postToCallback(CALLBACK_URL, {
+          job_id: JOB_ID,
+          secret: JOB_SECRET,
+          layout: null,
+          error: String(err && err.message ? err.message : err),
+        });
+      } catch (e2) {
+        console.error("[GLB Worker] Failed to report error to callback:", e2);
+      }
+    }
+    process.exit(1);
+  }
+})();
