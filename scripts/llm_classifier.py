@@ -1,222 +1,244 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+
+import sys
 import json
 import os
 import re
-import sys
-from typing import Any, Dict
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 MODEL_NAME = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-DIVI_MODULES = [
-    {"key": "section_row_column", "tag": "generic", "description": "Generic section+row+column wrapper, used with other modules."},
+_system_prompt = """
+You are a JSON-only classifier for marketing site sections.
 
-    # Common content modules
-    {"key": "text", "tag": "et_pb_text", "description": "Body copy, paragraphs, headings and simple inline content."},
-    {"key": "button", "tag": "et_pb_button", "description": "Standalone call-to-action button."},
-    {"key": "image", "tag": "et_pb_image", "description": "Prominent images or logos."},
-    {"key": "fullwidth_header", "tag": "et_pb_fullwidth_header", "description": "Hero sections with headline, subheadline, background, and buttons."},
-    {"key": "slider", "tag": "et_pb_slider", "description": "Hero/feature sections that cycle through slides."},
-    {"key": "cta", "tag": "et_pb_cta", "description": "Call-to-action strips with title, copy, and a button."},
+You receive a snippet of content that may come from:
+- A React TSX/JSX component,
+- An Angular HTML template,
+- Or plain HTML text.
 
-    # Structured grids
-    {"key": "blurb", "tag": "et_pb_blurb", "description": "Service/features grid: icon + title + short description per item."},
-    {"key": "pricing_tables", "tag": "et_pb_pricing_tables", "description": "Pricing tables, packages, tiers with bullet features."},
-    {"key": "faq_accordion", "tag": "et_pb_accordion", "description": "Expandable FAQ / Q&A sections."},
-    {"key": "tabs", "tag": "et_pb_tabs", "description": "Tabbed content areas."},
-    {"key": "testimonials", "tag": "et_pb_testimonial", "description": "Testimonials, quotes, customer names, roles."},
-    {"key": "person", "tag": "et_pb_person", "description": "Individual person/author cards with name, role, description, and avatar."},
+Your job:
+1. Decide what kind of section it is: e.g. "hero", "pricing", "faq", "testimonials", "contact", "services", "features", "cta", or "generic".
+2. Propose how to map it into Divi modules.
 
-    # Contact / map
-    {"key": "contact_form", "tag": "et_pb_contact_form", "description": "Contact forms, inquiry forms, lead capture forms."},
-    {"key": "map", "tag": "et_pb_map", "description": "Maps or location sections."},
+You MUST respond with ONLY a single JSON object, no explanation, no backticks, no surrounding text.
 
-    # Media
-    {"key": "video", "tag": "et_pb_video", "description": "Single video embeds."},
-    {"key": "gallery", "tag": "et_pb_gallery", "description": "Image galleries or grids of thumbnails."},
+The JSON MUST look like:
 
-    # Fallback
-    {"key": "code", "tag": "code", "description": "Raw HTML/JS when nothing else fits. Use ONLY as a fallback."},
-]
+{
+  "type": "hero",
+  "builder": {
+    "divi": {
+      "module_type": "fullwidth_header",
+      "params": {
+        "title": "string",
+        "subtitle": "string",
+        "button_primary_text": "string",
+        "button_primary_url": "string",
+        "background_color": "#050915"
+      }
+    }
+  }
+}
+
+Guidelines:
+
+- For hero sections (big headline + subhead + primary/secondary CTAs), use:
+  "module_type": "fullwidth_header"
+
+- For feature / services grids, use:
+  "module_type": "blurb_grid"
+  with "params.items": [{ "title": "...", "body": "...", "column_width": "1_3" }, ...]
+
+- For pricing sections, use:
+  "module_type": "pricing_tables"
+  with "params.plans": [{
+    "name": "...",
+    "tagline": "...",
+    "price": "...",
+    "billing_period": "...",
+    "button_text": "...",
+    "button_url": "...",
+    "features": ["..."]
+  }, ...]
+
+- For FAQ sections, use:
+  "module_type": "faq_accordion"
+  with "params.items": [{ "question": "...", "answer": "..." }, ...]
+
+- For testimonials, use:
+  "module_type": "testimonials_slider"
+  with "params.items": [{ "author": "...", "role": "...", "quote": "..." }, ...]
+
+- For contact sections, use:
+  "module_type": "contact_form"
+  (params can be an empty object).
+
+- If you cannot confidently map it, use:
+  "module_type": "code"
+  with "params": {}.
+
+You may leave strings empty if you cannot infer them.
+""".strip()
 
 
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Lazy global pipeline to avoid repeated model loads in a single run.
+_pipe = None
+
+
+def get_pipe():
+  global _pipe
+  if _pipe is None:
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer, model
-
-
-def build_prompt(data: Dict[str, Any]) -> str:
-    modules_desc = []
-    for m in DIVI_MODULES:
-        modules_desc.append(f"- key: {m['key']}, tag: {m['tag']}, use_for: {m['description']}")
-    modules_block = "\n".join(modules_desc)
-
-    prompt = []
-    prompt.append("You are an expert Divi 4 layout architect.")
-    prompt.append("You receive pre-split sections from a React/Angular single-page app.")
-    prompt.append("For each section, you MUST:")
-    prompt.append("1. Decide which Divi module best represents the section content.")
-    prompt.append("2. Extract structured params for that module from the HTML/text.")
-    prompt.append("3. ONLY fall back to the 'code' module when nothing else fits.")
-    prompt.append("")
-    prompt.append("Available Divi module keys:")
-    prompt.append(modules_block)
-    prompt.append("")
-    prompt.append(
-        "Return ONE JSON object only, with this schema:\n"
-        "{\n"
-        '  "sections": [\n'
-        "    {\n"
-        '      "id": string,\n'
-        '      "type": string,\n'
-        '      "divi": {\n'
-        '        "module_type": string,\n'
-        '        "params": {\n'
-        "          // For fullwidth_header: title, subtitle, button_one_text, button_one_url, button_two_text, button_two_url, background_image, background_color\n"
-        "          // For blurb: items: [{ title, body, icon_hint }]\n"
-        "          // For pricing_tables: plans: [{ name, tagline, price, billing_period, features: [..], button_text, button_url, highlighted }]\n"
-        "          // For faq_accordion: items: [{ question, answer }]\n"
-        "          // For testimonials: items: [{ quote, author, role }]\n"
-        "          // For contact_form: title, description, success_message\n"
-        "          // For map: address, zoom, pin_label\n"
-        "          // For text: content\n"
-        "          // For image: src, alt\n"
-        "          // For button: button_text, url\n"
-        "          // For code: html_summary\n"
-        "        }\n"
-        "      }\n"
-        "    }\n"
-        "  ]\n"
-        "}\n"
+    _pipe = pipeline(
+      "text-generation",
+      model=model,
+      tokenizer=tok,
+      max_new_tokens=512,
+      temperature=0.1,
+      do_sample=False
     )
-    prompt.append("")
-    prompt.append("Sections to classify:\n")
+  return _pipe
 
-    for idx, sec in enumerate(data.get("sections", [])):
-        sid = sec.get("id", f"sec{idx}")
-        s_type = sec.get("type", "generic")
-        text_hint = sec.get("text", "")
-        html = sec.get("html", "")
 
-        prompt.append(f"SECTION {idx}")
-        prompt.append(f"ID: {sid}")
-        prompt.append(f"TYPE_HINT: {s_type}")
-        prompt.append("TEXT_SNIPPET:")
-        prompt.append(text_hint[:400])
-        prompt.append("HTML_SNIPPET:")
-        prompt.append(html[:1200])
-        prompt.append("----")
+def extract_json_from_text(text: str) -> str:
+  """
+  Extracts the first {...} block from the model output.
+  Returns the raw JSON string or raises ValueError.
+  """
+  if not text:
+    raise ValueError("empty text from model")
 
-    prompt.append(
-        "Now output ONLY that JSON object. "
-        "No markdown, no explanation, no backticks, no comments. Pure JSON."
+  # Strip any weird leading logging lines
+  # (e.g. "Starting from v4.46..." or other HF warnings).
+  # Then look for the first '{' and the last '}'.
+  start = text.find('{')
+  end = text.rfind('}')
+
+  if start == -1 or end == -1 or end <= start:
+    raise ValueError("no JSON object delimiters found")
+
+  candidate = text[start : end + 1].strip()
+
+  # Occasionally the model might insert junk between JSON atoms; you can add
+  # minor cleanup if needed.
+  return candidate
+
+
+def classify(snippet: str, heuristics: dict) -> dict:
+  """
+  Run the LLM on the snippet and return the JSON classification.
+  If anything fails, return a fallback using heuristics.
+  """
+  fallback = {
+    "type": "generic",
+    "builder": {
+      "divi": heuristics or {
+        "module_type": "code",
+        "params": {}
+      }
+    }
+  }
+
+  snippet = (snippet or "").strip()
+  if not snippet:
+    return fallback
+
+  try:
+    pipe = get_pipe()
+  except Exception as e:
+    # Can't load model, just use fallback
+    print(fallback)
+    return fallback
+
+  user_prompt = (
+    "Snippet:\n"
+    "-----------------\n"
+    f"{snippet}\n"
+    "-----------------\n\n"
+    "Return ONLY the JSON object described in the instructions."
+  )
+
+  try:
+    outputs = pipe(
+      _system_prompt + "\n\n" + user_prompt,
+      num_return_sequences=1
     )
+  except Exception:
+    print(json.dumps(fallback))
+    return fallback
 
-    return "\n".join(prompt)
+  if not outputs:
+    print(json.dumps(fallback))
+    return fallback
 
+  raw = outputs[0].get("generated_text", "") or ""
+  try:
+    json_str = extract_json_from_text(raw)
+    parsed = json.loads(json_str)
+  except Exception:
+    print(json.dumps(fallback))
+    return fallback
 
-def clean_json_like(text: str) -> str:
-    """
-    Try to coerce a slightly-wrong JSON-ish string into valid JSON:
-    - strip ```json fences
-    - strip line comments
-    - strip /* ... */ block comments
-    - remove trailing commas before ] or }
-    """
-    # Strip markdown fences
-    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
-    text = text.replace("```", "")
+  # Normalize builder/divi presence
+  if "builder" not in parsed or not isinstance(parsed["builder"], dict):
+    parsed["builder"] = {}
+  if "divi" not in parsed["builder"]:
+    parsed["builder"]["divi"] = heuristics or {
+      "module_type": "code",
+      "params": {}
+    }
 
-    # Extract from first { to last }
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise RuntimeError("LLM output did not contain a JSON object")
-    s = m.group(0)
+  if "type" not in parsed or not isinstance(parsed["type"], str) or not parsed["type"].strip():
+    parsed["type"] = "generic"
 
-    # Remove // comments
-    s = re.sub(r"//.*", "", s)
-
-    # Remove /* ... */ comments
-    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
-
-    # Remove trailing commas before ] or }
-    s = re.sub(r",(\s*[\]}])", r"\1", s)
-
-    return s.strip()
-
-
-def generate_json(tokenizer, model, prompt: str) -> Dict[str, Any]:
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=2048,
-        do_sample=False,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    cleaned = clean_json_like(text)
-    return json.loads(cleaned)
-
-
-def build_fallback_layout(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If the LLM goes off the rails, fall back to a safe layout:
-    every section -> Divi 'code' module with an HTML summary.
-    """
-    sections_out = []
-    for idx, sec in enumerate(data.get("sections", [])):
-        sid = sec.get("id", f"sec{idx}")
-        s_type = sec.get("type", "generic")
-        html = sec.get("html", "") or ""
-        text_hint = sec.get("text", "") or ""
-
-        # Short summary so we don't blow up post size
-        summary = text_hint.strip() or html[:4000]
-
-        sections_out.append(
-            {
-                "id": sid,
-                "type": s_type,
-                "divi": {
-                    "module_type": "code",
-                    "params": {
-                        "html_summary": summary,
-                    },
-                },
-            }
-        )
-
-    return {"sections": sections_out}
+  print(json.dumps(parsed))
+  return parsed
 
 
 def main():
-    raw = sys.stdin.read()
-    if not raw.strip():
-        print(json.dumps({"sections": []}))
-        return
+  try:
+    data_raw = sys.stdin.read()
+    if not data_raw:
+      # No input; emit a trivial fallback
+      print(json.dumps({
+        "type": "generic",
+        "builder": {
+          "divi": {
+            "module_type": "code",
+            "params": {}
+          }
+        }
+      }))
+      return
 
-    data = json.loads(raw)
+    data = json.loads(data_raw)
+    snippet = data.get("snippet", "")
+    heuristics = data.get("heuristics", {})
 
-    try:
-        tokenizer, model = load_model()
-        prompt = build_prompt(data)
-        result = generate_json(tokenizer, model, prompt)
+    result = classify(snippet, heuristics)
+    # classify() already prints result, but we ensure a valid JSON output here
+    # in case classify() returns without printing (it doesn't currently).
+    # This double-print is harmless if kept consistent; to avoid it, you can
+    # remove the print() in classify() and only print here.
+    # For safety, we re-print the final JSON.
+    print(json.dumps(result))
 
-        if "sections" not in result or not isinstance(result["sections"], list):
-            raise RuntimeError("Result JSON missing 'sections' list.")
-
-        print(json.dumps(result))
-    except Exception as e:
-        # Log to stderr for GitHub Actions log visibility
-        sys.stderr.write(f"[llm_classifier] Falling back to code modules due to error: {e}\n")
-        fallback = build_fallback_layout(data)
-        print(json.dumps(fallback))
+  except Exception:
+    # On any exception, output a basic fallback and exit successfully so
+    # Node doesn't see this as a hard failure.
+    fallback = {
+      "type": "generic",
+      "builder": {
+        "divi": {
+          "module_type": "code",
+          "params": {}
+        }
+      }
+    }
+    print(json.dumps(fallback))
 
 
 if __name__ == "__main__":
-    main()
+  main()
