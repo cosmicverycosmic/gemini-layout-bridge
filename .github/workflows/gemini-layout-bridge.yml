@@ -46,7 +46,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install worker Node dependencies
         run: |
@@ -55,7 +55,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Python LLM dependencies
         run: |
@@ -84,6 +84,7 @@ jobs:
         run: |
           echo "Downloading ZIP from: ${{ github.event.inputs.zip_url }}"
           curl -L "${{ github.event.inputs.zip_url }}" -o app/app.zip
+          echo "Contents of ./app after download:"
           ls -lh app
 
       - name: Unzip Gemini app
@@ -96,14 +97,16 @@ jobs:
 
       - name: Debug: show primary TSX/HTML files if present
         run: |
-          echo "Listing top-level project files:"
-          ls -R .
-          echo "Showing App.tsx (if exists):"
+          echo "Listing project tree under ./app:"
+          ls -R app || true
+
+          echo "Showing App.tsx variants (if they exist):"
           sed -n '1,200p' app/App.tsx || true
-          sed -n '1,200p' src/App.tsx || true
-          echo "Showing index.html (if exists):"
+          sed -n '1,200p' app/src/App.tsx || true
+
+          echo "Showing index.html variants (if they exist):"
           sed -n '1,120p' app/index.html || true
-          sed -n '1,120p' index.html || true
+          sed -n '1,120p' app/public/index.html || true
 
       - name: Generate layout & post back to WordPress
         env:
@@ -114,6 +117,7 @@ jobs:
           PAGE_TITLE: ${{ github.event.inputs.page_title }}
           SLUG: ${{ github.event.inputs.slug }}
           GLB_LLM_MODEL: microsoft/Phi-3-mini-4k-instruct
+          GLB_LOG_LEVEL: debug
         run: |
           set -e
           echo "Starting layout generation with:"
@@ -122,6 +126,7 @@ jobs:
           echo "  CALLBACK_URL=$CALLBACK_URL"
           echo "  PAGE_TITLE=$PAGE_TITLE"
           echo "  SLUG=$SLUG"
+
           node scripts/generate-layout.js \
             --job-id "$JOB_ID" \
             --job-secret "$JOB_SECRET" \
