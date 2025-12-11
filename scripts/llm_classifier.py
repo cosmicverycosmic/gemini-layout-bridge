@@ -1,131 +1,123 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import os
 import sys
 import json
+import re
+import argparse
 from typing import Any, Dict
 
-import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-ALLOWED_TYPES = [
-    "hero",
-    "pricing",
-    "faq",
-    "testimonials",
-    "contact",
-    "features",
-    "gallery",
-    "generic",
-]
+# -------------------------------------------------------------------
+# Divi module catalog
+# -------------------------------------------------------------------
 
 ALLOWED_DIVI_MODULES = [
-    "fullwidth_header",   # hero headers
-    "blurb_grid",         # feature/service cards
-    "pricing_tables",     # pricing tables
-    "faq_accordion",      # FAQ accordions/toggles
-    "testimonials",       # testimonial cards
-    "contact_form",       # contact forms
-    "code",               # raw HTML fall-back
+    # Standard width modules
+    "accordion",
+    "audio",
+    "bar_counters",
+    "blurb",
+    "blog",
+    "button",
+    "call_to_action",
+    "circle_counter",
+    "code",
+    "comments",
+    "contact_form",
+    "countdown_timer",
+    "divider",
+    "email_optin",
+    "filterable_portfolio",
+    "gallery",
+    "image",
+    "login",
+    "map",
+    "number_counter",
+    "person",
+    "portfolio",
+    "post_navigation",
+    "post_slider",
+    "post_title",
+    "pricing_table",
+    "search",
+    "shop",
+    "sidebar",
+    "slider",
+    "social_media_follow",
+    "tabs",
+    "testimonial",
+    "text",
+    "toggle",
+    "video",
+    "video_slider",
+
+    # Fullwidth modules
+    "fullwidth_code",
+    "fullwidth_header",
+    "fullwidth_image",
+    "fullwidth_map",
+    "fullwidth_menu",
+    "fullwidth_post_title",
+    "fullwidth_portfolio",
+    "fullwidth_slider",
+    "fullwidth_post_slider",
+
+    # WooCommerce modules
+    "woo_breadcrumb",
+    "woo_cart_products",
+    "woo_cart_totals",
+    "woo_account",
+    "woo_add_to_cart",
+    "woo_billing",
+    "woo_cart",
+    "woo_checkout",
+    "woo_checkout_billing",
+    "woo_checkout_shipping",
+    "woo_checkout_information",
+    "woo_order_details",
+    "woo_products",
+    "woo_related_products",
+    "woo_reviews",
+    "woo_shipping",
+
+    # Our meta-layout helpers
+    "blurb_grid",
+    "pricing_tables",
+    "faq_accordion",
+    "testimonials",
+    "contact_form",
+    "code",
 ]
 
+PSEUDO_LAYOUT_MODULES = {
+    "blurb_grid",
+    "pricing_tables",
+    "faq_accordion",
+    "testimonials",
+    "contact_form",
+    "code",
+}
 
-def load_model():
-    model_name = os.getenv("GLB_LLM_MODEL", "microsoft/Phi-3-mini-4k-instruct")
-    print(f"[llm_classifier] Using model: {model_name}", file=sys.stderr)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map="cpu",
+# -------------------------------------------------------------------
+# Prompt construction
+# -------------------------------------------------------------------
+
+def build_prompt_html(html: str) -> str:
+    header = (
+        "You are a strict JSON generator for a Divi Builder layout classifier.\n"
+        "You MUST output ONE JSON object only, no commentary, no explanation.\n\n"
     )
-    return tokenizer, model
 
+    html_trimmed = html[:4000]
 
-def apply_chat_template(tokenizer, system_prompt: str, user_prompt: str) -> str:
-    """
-    Use a chat template if the tokenizer has one; otherwise, just concatenate.
-    """
-    if hasattr(tokenizer, "apply_chat_template"):
-        text = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            tokenize=False,
-        )
-        return text
-    else:
-        return system_prompt + "\n\nUser:\n" + user_prompt + "\n\nAssistant:"
-
-
-def run_model(tokenizer, model, prompt: str, max_new_tokens: int = 512) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt")
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    return text
-
-
-def extract_json(text: str) -> str:
-    """
-    Extract the first JSON object from the model output.
-    We look for the first '{' and the last '}' and slice.
-    """
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found in model output")
-    return text[start : end + 1]
-
-
-def needs_fix(data: Any) -> bool:
-    if not isinstance(data, dict):
-        return True
-    if "type" not in data or "builder" not in data:
-        return True
-
-    if data.get("type") not in ALLOWED_TYPES:
-        return True
-
-    builder = data.get("builder", {})
-    if not isinstance(builder, dict):
-        return True
-
-    divi = builder.get("divi")
-    if not isinstance(divi, dict):
-        return True
-
-    module_type = divi.get("module_type")
-    if module_type not in ALLOWED_DIVI_MODULES:
-        return True
-
-    params = divi.get("params", {})
-    if not isinstance(params, dict):
-        return True
-
-    # Everything necessary is there
-    return False
-
-
-def build_prompt_html(html: str, context: str) -> str:
-    context_str = context.strip()
-    header = ""
-    if context_str:
-        header = f"Context: {context_str}\n\n"
-
-    # Keep the schema description tight – we only want one JSON object.
-    user_prompt = f"""{header}You are classifying a single page section from a marketing website and deciding which Divi Builder module best fits.
+    user_prompt = f"""{header}You are classifying a single page section from a marketing or ecommerce website and deciding which Divi Builder module best fits.
 
 Section HTML (truncated if long):
 \"\"\"HTML
-{html[:4000]}
+{html_trimmed}
 \"\"\"HTML
 
 Return a SINGLE JSON object only, with this exact schema:
@@ -134,124 +126,204 @@ Return a SINGLE JSON object only, with this exact schema:
   "type": "hero|pricing|faq|testimonials|contact|features|gallery|generic",
   "builder": {{
     "divi": {{
-      "module_type": "fullwidth_header|blurb_grid|pricing_tables|faq_accordion|testimonials|contact_form|code",
+      "module_type": "<one Divi module slug>",
       "params": {{ ... freeform key/value pairs, or {{}} if unknown }}
     }}
   }}
 }}
 
+The `module_type` MUST be one of:
+
+Standard width modules:
+accordion, audio, bar_counters, blurb, blog, button, call_to_action, circle_counter,
+code, comments, contact_form, countdown_timer, divider, email_optin, filterable_portfolio,
+gallery, image, login, map, number_counter, person, portfolio, post_navigation,
+post_slider, post_title, pricing_table, search, shop, sidebar, slider,
+social_media_follow, tabs, testimonial, text, toggle, video, video_slider.
+
+Fullwidth modules:
+fullwidth_code, fullwidth_header, fullwidth_image, fullwidth_map, fullwidth_menu,
+fullwidth_post_title, fullwidth_portfolio, fullwidth_slider, fullwidth_post_slider.
+
+WooCommerce modules:
+woo_breadcrumb, woo_cart_products, woo_cart_totals, woo_account, woo_add_to_cart,
+woo_billing, woo_cart, woo_checkout, woo_checkout_billing, woo_checkout_shipping,
+woo_checkout_information, woo_order_details, woo_products, woo_related_products,
+woo_reviews, woo_shipping.
+
+Special layout-helper types we defined:
+blurb_grid (grid of blurbs),
+pricing_tables (multi-column pricing),
+faq_accordion (multi Q&A),
+testimonials (one or more testimonials),
+contact_form (contact form),
+code (raw HTML fallback).
+
 Guidance:
+- If the section is clearly a hero banner, pricing section, FAQ, testimonial block,
+  contact block, or feature grid, prefer the matching layout-helper type.
+- If it maps naturally to a single Divi module (e.g. blog list, shop, video),
+  choose that concrete module_type (e.g. "blog", "woo_products", "video").
+- If nothing clearly matches, set:
+    "type": "generic"
+    "builder.divi.module_type": "code"
 
-- "hero": top-of-page big header, usually with H1/H2 and primary CTA buttons.
-  -> module_type: "fullwidth_header"
-- "pricing": plans with prices and feature bullets.
-  -> module_type: "pricing_tables"
-- "faq": list of questions + answers.
-  -> module_type: "faq_accordion"
-- "testimonials": quotes from people, with names/roles.
-  -> module_type: "testimonials"
-- "contact": contact form, phone/email, addresses.
-  -> module_type: "contact_form"
-- A grid of cards/features/services.
-  -> module_type: "blurb_grid"
-- If nothing clearly matches, use:
-  -> type: "generic", module_type: "code"
+The "params" object should contain parsed, structured content when obvious. Use simple
+string or string-array values (no nested objects unless necessary).
 
-The "params" field should hold *parsed content* when obvious:
-- For hero: "title", "subtitle", "primary_button_text", "primary_button_url", etc.
-- For pricing: "plans": [{{"name", "price", "billing_period", "features": [...]}}, ...]
-- For FAQ: "items": [{{"question", "answer"}}, ...]
-- For testimonials: "items": [{{"quote", "author", "role"}}, ...]
-
-If you are unsure, still choose the closest module_type but you may keep params as {{}}.
-
-AGAIN: Output ONLY the JSON object, with no explanation, no markdown, no backticks.
+Output rules (CRITICAL):
+- Output ONLY one JSON object.
+- Do NOT wrap it in backticks or code fences.
+- Do NOT include any commentary before or after the JSON.
 """
+
     return user_prompt
 
 
-def build_checker_prompt(html: str, original_json: Dict[str, Any]) -> str:
-    original = json.dumps(original_json, ensure_ascii=False)
-    user_prompt = f"""We tried to classify a page section into a Divi Builder module.
+# -------------------------------------------------------------------
+# LLM invocation and JSON cleaning
+# -------------------------------------------------------------------
 
-Section HTML (truncated if long):
-\"\"\"HTML
-{html[:3000]}
-\"\"\"HTML
+def load_model():
+    model_name = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    return tokenizer, model
 
-Here is the FIRST JSON attempt:
-{original}
 
-This JSON must match this schema:
+def generate_raw(tokenizer, model, prompt: str) -> str:
+    inputs = tokenizer(prompt, return_tensors="pt")
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=True,
+        temperature=0.2,
+        top_p=0.9,
+        pad_token_id=getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id),
+    )
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return text
 
-{{
-  "type": "hero|pricing|faq|testimonials|contact|features|gallery|generic",
-  "builder": {{
-    "divi": {{
-      "module_type": "fullwidth_header|blurb_grid|pricing_tables|faq_accordion|testimonials|contact_form|code",
-      "params": {{ ... dict, can be empty }}
-    }}
-  }}
-}}
 
-If the JSON is already valid and consistent with the HTML, return it unchanged.
-If it is missing keys, uses an invalid type/module, or clearly contradicts the HTML, return a corrected JSON object that does match the schema.
+def extract_json(text: str) -> str:
+    """
+    Try to pull the first JSON object out of the model's text.
+    """
+    # Strip code fences if present
+    fence_match = re.search(r"```(?:json)?(.*)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1)
 
-Output ONLY the final JSON object, with no extra text, no markdown, no backticks.
-"""
-    return user_prompt
+    # Find first {...} block
+    brace_match = re.search(r"\{[\s\S]*\}", text)
+    if not brace_match:
+        raise ValueError("No JSON object found in model output")
+    json_str = brace_match.group(0).strip()
+    return json_str
 
+
+def needs_fix(obj: Dict[str, Any]) -> bool:
+    try:
+        if not isinstance(obj, dict):
+            return True
+        t = obj.get("type")
+        if t not in ["hero", "pricing", "faq", "testimonials", "contact", "features", "gallery", "generic"]:
+            return True
+
+        builder = obj.get("builder")
+        if not isinstance(builder, dict):
+            return True
+        divi = builder.get("divi")
+        if not isinstance(divi, dict):
+            return True
+
+        module_type = divi.get("module_type")
+        if not isinstance(module_type, str) or module_type not in ALLOWED_DIVI_MODULES:
+            return True
+
+        # params must be dict if present
+        params = divi.get("params", {})
+        if not isinstance(params, dict):
+            return True
+        return False
+    except Exception:
+        return True
+
+
+def normalize(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce schema and safe defaults.
+    """
+    if not isinstance(obj, dict):
+        obj = {}
+
+    t = obj.get("type")
+    if t not in ["hero", "pricing", "faq", "testimonials", "contact", "features", "gallery", "generic"]:
+        t = "generic"
+
+    builder = obj.get("builder")
+    if not isinstance(builder, dict):
+        builder = {}
+
+    divi = builder.get("divi")
+    if not isinstance(divi, dict):
+        divi = {}
+
+    module_type = divi.get("module_type")
+    if not isinstance(module_type, str) or module_type not in ALLOWED_DIVI_MODULES:
+        module_type = "code"
+
+    params = divi.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    return {
+        "type": t,
+        "builder": {
+            "divi": {
+                "module_type": module_type,
+                "params": params,
+            }
+        },
+    }
+
+
+def classify_html_section(html: str) -> Dict[str, Any]:
+    prompt = build_prompt_html(html)
+    tokenizer, model = load_model()
+    raw = generate_raw(tokenizer, model, prompt)
+    json_str = extract_json(raw)
+
+    try:
+        obj = json.loads(json_str)
+    except Exception as e:
+        raise ValueError(f"Failed to parse JSON from model output: {e}")
+
+    cleaned = normalize(obj)
+    return cleaned
+
+
+# -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
 
 def main():
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("{}", end="")
-        return
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        # If stdin is not JSON for some reason, treat it as raw HTML.
-        payload = {"html": raw, "context": ""}
-
-    html = payload.get("html", "")
-    context = payload.get("context", "")
-
-    tokenizer, model = load_model()
-
-    system_prompt = (
-        "You are an expert Divi / marketing-site IA, mapping HTML sections "
-        "into Divi Builder modules with structured JSON."
+    parser = argparse.ArgumentParser(description="Classify a single HTML section into Divi module metadata.")
+    parser.add_argument(
+        "--html-file",
+        help="Path to a file containing the HTML for this section. If omitted, reads from stdin.",
     )
-    user_prompt = build_prompt_html(html, context)
-    full_prompt = apply_chat_template(tokenizer, system_prompt, user_prompt)
+    args = parser.parse_args()
 
-    # First pass
-    text = run_model(tokenizer, model, full_prompt, max_new_tokens=512)
+    if args.html_file:
+        with open(args.html_file, "r", encoding="utf-8") as f:
+            html = f.read()
+    else:
+        html = sys.stdin.read()
 
-    try:
-        json_str = extract_json(text)
-        data = json.loads(json_str)
-    except Exception as e:
-        print(f"[llm_classifier] First-pass JSON extraction failed: {e}", file=sys.stderr)
-        data = None
-
-    # Checker / second pass if needed
-    if data is None or needs_fix(data):
-        try:
-            checker_prompt = build_checker_prompt(html, data or {})
-            full_checker_prompt = apply_chat_template(tokenizer, system_prompt, checker_prompt)
-            text2 = run_model(tokenizer, model, full_checker_prompt, max_new_tokens=512)
-            json_str2 = extract_json(text2)
-            data2 = json.loads(json_str2)
-            if not needs_fix(data2):
-                data = data2
-        except Exception as e:
-            print(f"[llm_classifier] Checker failed: {e}", file=sys.stderr)
-
-    # Final fall-back if still bad
-    if data is None or needs_fix(data):
-        data = {
+    if not html.strip():
+        # Emit a safe fallback JSON
+        fallback = {
             "type": "generic",
             "builder": {
                 "divi": {
@@ -260,9 +332,29 @@ def main():
                 }
             },
         }
+        print(json.dumps(fallback, ensure_ascii=False))
+        return
 
-    # IMPORTANT: print JSON ONLY, once.
-    print(json.dumps(data, ensure_ascii=False))
+    try:
+        result = classify_html_section(html)
+    except Exception as e:
+        # Final safety net: emit generic code module so the worker never crashes
+        fallback = {
+            "type": "generic",
+            "builder": {
+                "divi": {
+                    "module_type": "code",
+                    "params": {
+                        "_error": str(e),
+                    },
+                }
+            },
+        }
+        print(json.dumps(fallback, ensure_ascii=False))
+        return
+
+    # IMPORTANT: stdout is JSON ONLY, no logs.
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":
