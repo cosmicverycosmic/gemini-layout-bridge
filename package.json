@@ -1,0 +1,13 @@
+{
+  "name": "gemini-layout-worker",
+  "version": "2.0.0",
+  "private": true,
+  "main": "scripts/generate-layout.js",
+  "scripts": {
+    "generate-layout": "node scripts/generate-layout.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "jsdom": "^24.0.0"
+  }
+}
