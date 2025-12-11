@@ -1,221 +1,168 @@
-#!/usr/bin/env python
-import sys
+#!/usr/bin/env python3
 import json
 import os
+import re
+import sys
+from typing import Any, Dict, List
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-DEFAULT_MODEL = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-print(f"[llm_classifier] Loading model: {DEFAULT_MODEL}...", file=sys.stderr)
-tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL)
-model = AutoModelForCausalLM.from_pretrained(
-    DEFAULT_MODEL,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto"
-)
-print("[llm_classifier] Model loaded.", file=sys.stderr)
+MODEL_NAME = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 
 DIVI_MODULES = [
-    "fullwidth_header",
-    "blurb_grid",
-    "pricing_tables",
-    "faq_accordion",
-    "testimonials_slider",
-    "contact_form",
-    "code"
+    # Generic layout
+    {"key": "section_row_column", "tag": "generic", "description": "Generic section+row+column wrapper, used with other modules."},
+
+    # Common content modules
+    {"key": "text", "tag": "et_pb_text", "description": "Body copy, paragraphs, headings and simple inline content."},
+    {"key": "button", "tag": "et_pb_button", "description": "Standalone call-to-action button."},
+    {"key": "image", "tag": "et_pb_image", "description": "Prominent images or logos."},
+    {"key": "fullwidth_header", "tag": "et_pb_fullwidth_header", "description": "Hero sections with headline, subheadline, background, and one or two buttons."},
+    {"key": "slider", "tag": "et_pb_slider", "description": "Hero/feature sections that cycle through slides."},
+    {"key": "cta", "tag": "et_pb_cta", "description": "Call-to-action strips with title, copy, and a button."},
+
+    # Structured grids
+    {"key": "blurb", "tag": "et_pb_blurb", "description": "Service/features grid: icon + title + short description per item."},
+    {"key": "pricing_tables", "tag": "et_pb_pricing_tables", "description": "Pricing tables, packages, tiers with bullet features."},
+    {"key": "faq_accordion", "tag": "et_pb_accordion", "description": "Expandable FAQ / Q&A sections."},
+    {"key": "tabs", "tag": "et_pb_tabs", "description": "Tabbed content areas."},
+    {"key": "testimonials", "tag": "et_pb_testimonial", "description": "Testimonials, quotes, customer names, roles."},
+    {"key": "person", "tag": "et_pb_person", "description": "Individual person/author cards with name, role, description, and avatar."},
+
+    # Contact / map / data
+    {"key": "contact_form", "tag": "et_pb_contact_form", "description": "Contact forms, inquiry forms, lead capture forms."},
+    {"key": "map", "tag": "et_pb_map", "description": "Google map or address map blocks."},
+
+    # Media
+    {"key": "video", "tag": "et_pb_video", "description": "Single video embeds."},
+    {"key": "gallery", "tag": "et_pb_gallery", "description": "Image galleries or grids of thumbnails."},
+
+    # Fallback
+    {"key": "code", "tag": "code", "description": "Raw HTML/JS when nothing else fits. Use ONLY as a fallback."},
 ]
 
-BASE_INSTRUCTIONS = """
-You are a web layout classifier that maps HTML sections of a landing page into Divi Builder modules.
 
-Available module types (you MUST choose exactly one):
-- fullwidth_header
-- blurb_grid
-- pricing_tables
-- faq_accordion
-- testimonials_slider
-- contact_form
-- code   (generic fallback if nothing else fits)
-
-Rules:
-- If it's a hero section with main headline, subheadline, and primary CTA(s), use "fullwidth_header".
-- If it lists 2-6 services/features in cards or columns, use "blurb_grid".
-- If it clearly shows plans/pricing tiers, use "pricing_tables".
-- If it's clearly a list of questions and answers, use "faq_accordion".
-- If it's customer quotes with names/roles, use "testimonials_slider".
-- If it has a contact form or call-to-contact, use "contact_form".
-- Otherwise, use "code".
-
-You must return ONLY a JSON object with this shape:
-{
-  "module_type": "<one of the above>",
-  "params": {
-    ...
-  }
-}
-
-"params" keys should match the module type, e.g.:
-
-For fullwidth_header:
-- title
-- subtitle
-- button_primary_text
-- button_primary_url
-- background_color
-
-For blurb_grid:
-- items: [ { "title": "...", "body": "..." }, ... ]
-
-For pricing_tables:
-- plans: [
-    {
-      "name": "...",
-      "tagline": "...",
-      "price": "...",
-      "billing_period": "...",
-      "button_text": "...",
-      "button_url": "...",
-      "features": [ "...", "..." ]
-    }, ...
-  ]
-
-For faq_accordion:
-- items: [ { "question": "...", "answer": "..." }, ... ]
-
-For testimonials_slider:
-- items: [ { "author": "...", "role": "...", "quote": "..." }, ... ]
-
-For contact_form:
-- title
-- subtitle
-
-If you cannot confidently fill a field, you may omit it.
-If you cannot classify the section into any of the specific types, use:
-{
-  "module_type": "code",
-  "params": {}
-}
-"""
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer, model
 
 
-def build_prompt(section):
-  text = section.get("text", "")
-  snippet = section.get("htmlSnippet", "")
-  sec_type = section.get("type", "generic")
-  sec_id = section.get("id", "")
-  sec_classes = section.get("classes", "")
+def build_prompt(data: Dict[str, Any]) -> str:
+    """Build a single text prompt for a plain causal LM."""
+    modules_desc = []
+    for m in DIVI_MODULES:
+        modules_desc.append(f"- key: {m['key']}, tag: {m['tag']}, use_for: {m['description']}")
+    modules_block = "\n".join(modules_desc)
 
-  text = text[:800]
-  snippet = snippet[:800]
+    prompt = []
+    prompt.append("You are an expert Divi 4 layout architect.")
+    prompt.append("You receive pre-split sections from a React/Angular single-page app.")
+    prompt.append("For each section, you must:")
+    prompt.append("1. Decide which Divi module best represents the section content.")
+    prompt.append("2. Extract structured params for that module from the HTML/text.")
+    prompt.append("3. ONLY fall back to the 'code' module when nothing else fits.")
+    prompt.append("")
+    prompt.append("Available Divi module keys:")
+    prompt.append(modules_block)
+    prompt.append("")
+    prompt.append(
+        "Schema you MUST output (pure JSON, no commentary):\n"
+        "{\n"
+        '  "sections": [\n'
+        "    {\n"
+        '      "id": string,\n'
+        '      "type": string,           // hero, services, pricing, faq, testimonials, contact, region, generic, etc.\n'
+        '      "divi": {\n'
+        '        "module_type": string,  // one of the keys above, e.g. "fullwidth_header", "blurb", "pricing_tables", "faq_accordion", "testimonials", "contact_form", "map", "text", "button", "image", "code"\n'
+        '        "params": {             // params appropriate to that module\n'
+        "          // For fullwidth_header: title, subtitle, button_one_text, button_one_url, button_two_text, button_two_url, background_image, background_color\n"
+        "          // For blurb: items: [{ title, body, icon_hint }]\n"
+        "          // For pricing_tables: plans: [{ name, tagline, price, billing_period, features: [..], button_text, button_url, highlighted }]\n"
+        "          // For faq_accordion: items: [{ question, answer }]\n"
+        "          // For testimonials: items: [{ quote, author, role }]\n"
+        "          // For contact_form: title, description, success_message (if present)\n"
+        "          // For map: address, zoom, pin_label\n"
+        "          // For text: content (HTML/text summary)\n"
+        "          // For image: src, alt\n"
+        "          // For button: button_text, url\n"
+        "          // For code: html_summary (short description; raw HTML is provided elsewhere)\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+    prompt.append("")
+    prompt.append("Sections to classify:\n")
 
-  return (
-    BASE_INSTRUCTIONS
-    + "\n\n--- SECTION METADATA ---\n"
-    + f"Type hint: {sec_type}\n"
-    + f"ID: {sec_id}\n"
-    + f"Classes: {sec_classes}\n"
-    + "\n--- SECTION TEXT (approximate) ---\n"
-    + text
-    + "\n\n--- SECTION HTML SNIPPET ---\n"
-    + snippet
-    + "\n\nNow respond with ONLY the JSON object (no explanation, no backticks)."
-  )
+    for idx, sec in enumerate(data.get("sections", [])):
+        sid = sec.get("id", f"sec{idx}")
+        s_type = sec.get("type", "generic")
+        text_hint = sec.get("text", "")
+        html = sec.get("html", "")
 
+        prompt.append(f"SECTION {idx}")
+        prompt.append(f"ID: {sid}")
+        prompt.append(f"TYPE_HINT: {s_type}")
+        prompt.append("TEXT_SNIPPET:")
+        prompt.append(text_hint[:400])
+        prompt.append("HTML_SNIPPET:")
+        # Trim HTML to keep context but avoid blowing up.
+        prompt.append(html[:1200])
+        prompt.append("----")
 
-def run_model(prompt):
-  inputs = tokenizer(prompt, return_tensors="pt")
-  input_ids = inputs["input_ids"].to(model.device)
-  attention_mask = inputs["attention_mask"].to(model.device)
-
-  with torch.no_grad():
-    outputs = model.generate(
-      input_ids=input_ids,
-      attention_mask=attention_mask,
-      max_new_tokens=384,
-      do_sample=False,
-      pad_token_id=tokenizer.eos_token_id
+    prompt.append(
+        "Now output ONLY the JSON object described above. "
+        "Do NOT include any explanation or markdown. "
+        "Always choose the most specific non-'code' module that fits. "
+        "Use 'code' only as last resort."
     )
 
-  generated = outputs[0][input_ids.shape[-1]:]
-  text = tokenizer.decode(generated, skip_special_tokens=True)
-  return text.strip()
+    return "\n".join(prompt)
 
 
-def parse_json_from_output(text):
-  text = text.strip()
+def generate_json(tokenizer, model, prompt: str) -> Dict[str, Any]:
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=2048,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-  start = text.find("{")
-  end = text.rfind("}")
-  if start == -1 or end == -1 or end <= start:
-    raise ValueError("No JSON object found in output")
+    # Extract JSON from the tail (between first '{' and last '}')
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError("LLM output did not contain JSON object.")
+    json_str = m.group(0)
 
-  json_str = text[start : end + 1]
-  return json.loads(json_str)
-
-
-def classify_section(section):
-  try:
-    prompt = build_prompt(section)
-    raw = run_model(prompt)
-    obj = parse_json_from_output(raw)
-
-    module_type = obj.get("module_type", "code")
-    if module_type not in DIVI_MODULES:
-      module_type = "code"
-
-    params = obj.get("params", {})
-    if not isinstance(params, dict):
-      params = {}
-
-    return module_type, params
-  except Exception as e:
-    # Fallback: simple heuristic
-    txt = section.get("text", "").lower()
-    if "pricing" in txt or "per month" in txt or "plan" in txt:
-      return "pricing_tables", {}
-    if "faq" in txt or "frequently asked questions" in txt:
-      return "faq_accordion", {}
-    if "contact" in txt or "get in touch" in txt:
-      return "contact_form", {}
-    if "testimonials" in txt or "what our clients say" in txt:
-      return "testimonials_slider", {}
-    return "code", {}
+    return json.loads(json_str)
 
 
 def main():
-  raw = sys.stdin.read()
-  data = json.loads(raw)
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print(json.dumps({"sections": []}))
+        return
 
-  builder = data.get("builder", "divi")
-  sections = data.get("sections", [])
+    data = json.loads(raw)
 
-  results = []
+    tokenizer, model = load_model()
+    prompt = build_prompt(data)
+    result = generate_json(tokenizer, model, prompt)
 
-  if builder != "divi":
-    # Nothing to do; but keep shape
-    for s in sections:
-      idx = s.get("index", 0)
-      results.append({
-        "index": idx,
-        "module_type": "code",
-        "params": {}
-      })
-  else:
-    for s in sections:
-      idx = s.get("index", 0)
-      module_type, params = classify_section(s)
-      results.append({
-        "index": idx,
-        "module_type": module_type,
-        "params": params
-      })
+    # Very lightweight sanity check
+    if "sections" not in result or not isinstance(result["sections"], list):
+        raise RuntimeError("Result JSON missing 'sections' list.")
 
-  out = {"results": results}
-  sys.stdout.write(json.dumps(out))
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":
-  main()
+    main()
