@@ -16,7 +16,7 @@ function parseArgs() {
   for (let i = 0; i < args.length; i += 2) {
     const key = args[i];
     const val = args[i + 1];
-    if (!key || typeof val === "undefined") continue;
+    if (!key || !val) continue;
     if (key.startsWith("--")) {
       out[key.slice(2)] = val;
     }
@@ -84,8 +84,35 @@ function splitHtmlIntoSections(html) {
 }
 
 /**
- * Detect whether this is an Angular or React app, and obtain
- * base HTML content + an array of section HTML strings.
+ * Very light JSX cleanup for when we end up feeding raw TSX/JSX HTML
+ * straight into Divi. This does NOT execute JS; it just removes the
+ * most obvious framework-only noise so you don’t see comments and
+ * map() calls printed on the page.
+ */
+function basicJsxCleanup(src) {
+  let out = String(src);
+
+  // Remove {/* ... */} comments
+  out = out.replace(/{\s*\/\*[\s\S]*?\*\/\s*}/g, "");
+
+  // Remove line-level JS expressions that obviously aren't content
+  // e.g. {features.map((feature) => (...))}, {item.title}, etc.
+  // This is intentionally aggressive; real “smart” rendering should
+  // come from the classifier via `normalized_html`.
+  out = out.replace(/{[^<>]*map\([^)]*\)\s*=>\s*\([^)]*\)[^}]*}/g, "");
+  out = out.replace(/{\s*[a-zA-Z0-9_.]+\s*}/g, "");
+
+  return out;
+}
+
+/**
+ * Detect whether this is an Angular, React/TSX, or static HTML app.
+ * Returns:
+ * {
+ *   framework: "angular" | "react" | "static" | "unknown",
+ *   fullHtml: string,
+ *   sections: string[]   // raw section snippets (may still be TSX)
+ * }
  */
 function analyzeApp(appDir) {
   log("Analyzing app at", appDir);
@@ -106,33 +133,43 @@ function analyzeApp(appDir) {
 
   if (tsxFiles.length > 0) {
     log("Detected React/TSX app; TSX files found.");
-    let combinedHtml = "";
+
+    // Heuristic: each TSX file likely represents a meaningful chunk.
+    // We pass the *file content* to the classifier, which can then
+    // produce a cleaned `normalized_html` section if it wants.
+    const snippets = [];
+
     for (const f of tsxFiles) {
-      const src = fs.readFileSync(f, "utf8");
-      // Very naive extraction: look for JSX fragments containing <section or <main>
-      const match = src.match(/(<(section|main)[\s\S]*?<\/(section|main)>)/i);
-      if (match) {
-        combinedHtml += "\n" + match[1] + "\n";
+      try {
+        const src = fs.readFileSync(f, "utf8");
+        snippets.push(src);
+      } catch (e) {
+        console.error("[GLB Worker] Failed to read TSX file", f, e.message);
       }
     }
-    if (!combinedHtml.trim()) {
-      // If nothing obvious, just fall back to a root div
-      combinedHtml = '<div id="root"></div>';
+
+    if (!snippets.length) {
+      const fallback = '<div id="root"></div>';
+      return {
+        framework: "react",
+        fullHtml: fallback,
+        sections: [fallback],
+      };
     }
-    const sections = splitHtmlIntoSections(combinedHtml);
+
     return {
       framework: "react",
-      fullHtml: combinedHtml,
-      sections,
+      fullHtml: snippets.join("\n\n"),
+      sections: snippets,
     };
   }
 
   // Fallback: try index.html
   const indexHtml = path.join(appDir, "index.html");
   if (fs.existsSync(indexHtml)) {
-    log("Detected static index.html app.");
     const full = fs.readFileSync(indexHtml, "utf8");
     const sections = splitHtmlIntoSections(full);
+    log("Detected static HTML (index.html).");
     return {
       framework: "static",
       fullHtml: full,
@@ -151,22 +188,30 @@ function analyzeApp(appDir) {
 }
 
 /**
- * Call the Python classifier for a single section HTML snippet.
- * We send raw HTML on stdin; Python prints ONE JSON object on stdout.
+ * Call the Python classifier for a single section snippet.
+ * We send JSON on stdin to avoid escaping issues.
+ *
+ * The classifier is expected to *at least* return:
+ *   { "type": "generic", "builder": { "divi": { "module_type": "code", "params": {} } } }
+ *
+ * It MAY also return:
+ *   "normalized_html": "<section>...</section>"
+ * which we will prefer for Divi output when present.
  */
-function classifySection(sectionHtml, context) {
+function classifySection(sectionSource, context, framework) {
+  const payload = {
+    html: sectionSource,
+    context: context || "",
+    framework: framework || "unknown",
+  };
+
   const env = { ...process.env };
-
-  // Pass context as a hint to the classifier, if we want to use it later.
-  env.GLB_SECTION_CONTEXT = context || "";
-
-  // Default to a stronger model if none is set.
   if (!env.GLB_LLM_MODEL) {
     env.GLB_LLM_MODEL = "microsoft/Phi-3-mini-4k-instruct";
   }
 
   const res = spawnSync("python", ["scripts/llm_classifier.py"], {
-    input: sectionHtml,
+    input: JSON.stringify(payload),
     encoding: "utf8",
     env,
   });
@@ -179,7 +224,7 @@ function classifySection(sectionHtml, context) {
   if (res.status !== 0) {
     console.error("[LLM] classifier non-zero exit:", res.status);
     if (res.stderr) console.error(res.stderr);
-    else if (res.stdout) console.error(res.stdout);
+    if (res.stdout) console.error(res.stdout);
     return null;
   }
 
@@ -263,7 +308,7 @@ async function main() {
 
   // 2) Build layout object
   const layout = {
-    head_html: cssBundle, // WP side can decide how to inject this into <head>
+    head_html: cssBundle, // injected into <head> by the WP plugin
     body_class: "",
     sections: [],
   };
@@ -282,7 +327,7 @@ async function main() {
       builder: {},
     });
   } else {
-    // Divi (or future builders): classify each section individually
+    // Divi (or other future builders): classify each section individually
     if (!appInfo.sections || appInfo.sections.length === 0) {
       console.warn(
         "[GLB Worker] No sections found; falling back to one root section."
@@ -298,22 +343,42 @@ async function main() {
         builder: {},
       });
     } else {
-      appInfo.sections.forEach((html, idx) => {
+      appInfo.sections.forEach((rawSnippet, idx) => {
         const sectionId = `section-${idx + 1}`;
-        const context = `app=${appInfo.framework}, index=${idx}, pageTitle=${pageTitle}`;
+        const context = `app=${appInfo.framework}, index=${idx}, pageTitle=${pageTitle}, slug=${slug}`;
         const cls = `glb-section glb-section-${sectionId} glb-type-generic`;
 
-        const classification = classifySection(html, context);
+        const classification = classifySection(rawSnippet, context, appInfo.framework);
+
         let type = "generic";
         let builderMap = {};
+        let finalHtml = rawSnippet;
 
         if (classification && typeof classification === "object") {
           type = classification.type || "generic";
           builderMap = classification.builder || {};
+
+          if (classification.normalized_html) {
+            finalHtml = classification.normalized_html;
+          } else if (appInfo.framework === "react") {
+            // If we didn't get a normalized HTML from the classifier
+            // but we're feeding TSX, at least clean out obvious JSX.
+            finalHtml = basicJsxCleanup(rawSnippet);
+          }
+
+          const diviConf = builderMap.divi || {};
+          log(
+            `Section ${sectionId}: type=${type}, divi.module_type=${diviConf.module_type || "N/A"}`
+          );
         } else {
           console.warn(
-            "[GLB Worker] classifier returned null; using generic/code."
+            "[GLB Worker] classifier returned null; using generic/code for",
+            sectionId
           );
+          finalHtml =
+            appInfo.framework === "react"
+              ? basicJsxCleanup(rawSnippet)
+              : rawSnippet;
           builderMap = {
             divi: {
               module_type: "code",
@@ -325,7 +390,7 @@ async function main() {
         layout.sections.push({
           id: sectionId,
           class: cls,
-          html,
+          html: finalHtml,
           type,
           builder: builderMap,
         });
