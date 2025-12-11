@@ -3,23 +3,20 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-
 MODEL_NAME = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-
 DIVI_MODULES = [
-    # Generic layout
     {"key": "section_row_column", "tag": "generic", "description": "Generic section+row+column wrapper, used with other modules."},
 
     # Common content modules
     {"key": "text", "tag": "et_pb_text", "description": "Body copy, paragraphs, headings and simple inline content."},
     {"key": "button", "tag": "et_pb_button", "description": "Standalone call-to-action button."},
     {"key": "image", "tag": "et_pb_image", "description": "Prominent images or logos."},
-    {"key": "fullwidth_header", "tag": "et_pb_fullwidth_header", "description": "Hero sections with headline, subheadline, background, and one or two buttons."},
+    {"key": "fullwidth_header", "tag": "et_pb_fullwidth_header", "description": "Hero sections with headline, subheadline, background, and buttons."},
     {"key": "slider", "tag": "et_pb_slider", "description": "Hero/feature sections that cycle through slides."},
     {"key": "cta", "tag": "et_pb_cta", "description": "Call-to-action strips with title, copy, and a button."},
 
@@ -31,9 +28,9 @@ DIVI_MODULES = [
     {"key": "testimonials", "tag": "et_pb_testimonial", "description": "Testimonials, quotes, customer names, roles."},
     {"key": "person", "tag": "et_pb_person", "description": "Individual person/author cards with name, role, description, and avatar."},
 
-    # Contact / map / data
+    # Contact / map
     {"key": "contact_form", "tag": "et_pb_contact_form", "description": "Contact forms, inquiry forms, lead capture forms."},
-    {"key": "map", "tag": "et_pb_map", "description": "Google map or address map blocks."},
+    {"key": "map", "tag": "et_pb_map", "description": "Maps or location sections."},
 
     # Media
     {"key": "video", "tag": "et_pb_video", "description": "Single video embeds."},
@@ -53,7 +50,6 @@ def load_model():
 
 
 def build_prompt(data: Dict[str, Any]) -> str:
-    """Build a single text prompt for a plain causal LM."""
     modules_desc = []
     for m in DIVI_MODULES:
         modules_desc.append(f"- key: {m['key']}, tag: {m['tag']}, use_for: {m['description']}")
@@ -62,7 +58,7 @@ def build_prompt(data: Dict[str, Any]) -> str:
     prompt = []
     prompt.append("You are an expert Divi 4 layout architect.")
     prompt.append("You receive pre-split sections from a React/Angular single-page app.")
-    prompt.append("For each section, you must:")
+    prompt.append("For each section, you MUST:")
     prompt.append("1. Decide which Divi module best represents the section content.")
     prompt.append("2. Extract structured params for that module from the HTML/text.")
     prompt.append("3. ONLY fall back to the 'code' module when nothing else fits.")
@@ -71,26 +67,26 @@ def build_prompt(data: Dict[str, Any]) -> str:
     prompt.append(modules_block)
     prompt.append("")
     prompt.append(
-        "Schema you MUST output (pure JSON, no commentary):\n"
+        "Return ONE JSON object only, with this schema:\n"
         "{\n"
         '  "sections": [\n'
         "    {\n"
         '      "id": string,\n'
-        '      "type": string,           // hero, services, pricing, faq, testimonials, contact, region, generic, etc.\n'
+        '      "type": string,\n'
         '      "divi": {\n'
-        '        "module_type": string,  // one of the keys above, e.g. "fullwidth_header", "blurb", "pricing_tables", "faq_accordion", "testimonials", "contact_form", "map", "text", "button", "image", "code"\n'
-        '        "params": {             // params appropriate to that module\n'
+        '        "module_type": string,\n'
+        '        "params": {\n'
         "          // For fullwidth_header: title, subtitle, button_one_text, button_one_url, button_two_text, button_two_url, background_image, background_color\n"
         "          // For blurb: items: [{ title, body, icon_hint }]\n"
         "          // For pricing_tables: plans: [{ name, tagline, price, billing_period, features: [..], button_text, button_url, highlighted }]\n"
         "          // For faq_accordion: items: [{ question, answer }]\n"
         "          // For testimonials: items: [{ quote, author, role }]\n"
-        "          // For contact_form: title, description, success_message (if present)\n"
+        "          // For contact_form: title, description, success_message\n"
         "          // For map: address, zoom, pin_label\n"
-        "          // For text: content (HTML/text summary)\n"
+        "          // For text: content\n"
         "          // For image: src, alt\n"
         "          // For button: button_text, url\n"
-        "          // For code: html_summary (short description; raw HTML is provided elsewhere)\n"
+        "          // For code: html_summary\n"
         "        }\n"
         "      }\n"
         "    }\n"
@@ -112,18 +108,45 @@ def build_prompt(data: Dict[str, Any]) -> str:
         prompt.append("TEXT_SNIPPET:")
         prompt.append(text_hint[:400])
         prompt.append("HTML_SNIPPET:")
-        # Trim HTML to keep context but avoid blowing up.
         prompt.append(html[:1200])
         prompt.append("----")
 
     prompt.append(
-        "Now output ONLY the JSON object described above. "
-        "Do NOT include any explanation or markdown. "
-        "Always choose the most specific non-'code' module that fits. "
-        "Use 'code' only as last resort."
+        "Now output ONLY that JSON object. "
+        "No markdown, no explanation, no backticks, no comments. Pure JSON."
     )
 
     return "\n".join(prompt)
+
+
+def clean_json_like(text: str) -> str:
+    """
+    Try to coerce a slightly-wrong JSON-ish string into valid JSON:
+    - strip ```json fences
+    - strip line comments
+    - strip /* ... */ block comments
+    - remove trailing commas before ] or }
+    """
+    # Strip markdown fences
+    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
+    text = text.replace("```", "")
+
+    # Extract from first { to last }
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError("LLM output did not contain a JSON object")
+    s = m.group(0)
+
+    # Remove // comments
+    s = re.sub(r"//.*", "", s)
+
+    # Remove /* ... */ comments
+    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
+
+    # Remove trailing commas before ] or }
+    s = re.sub(r",(\s*[\]}])", r"\1", s)
+
+    return s.strip()
 
 
 def generate_json(tokenizer, model, prompt: str) -> Dict[str, Any]:
@@ -136,13 +159,8 @@ def generate_json(tokenizer, model, prompt: str) -> Dict[str, Any]:
     )
     text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # Extract JSON from the tail (between first '{' and last '}')
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise RuntimeError("LLM output did not contain JSON object.")
-    json_str = m.group(0)
-
-    return json.loads(json_str)
+    cleaned = clean_json_like(text)
+    return json.loads(cleaned)
 
 
 def main():
@@ -155,9 +173,14 @@ def main():
 
     tokenizer, model = load_model()
     prompt = build_prompt(data)
-    result = generate_json(tokenizer, model, prompt)
 
-    # Very lightweight sanity check
+    try:
+        result = generate_json(tokenizer, model, prompt)
+    except Exception as e:
+        # Dump raw text to stderr to debug if needed
+        sys.stderr.write(f"[llm_classifier] Failed to parse JSON: {e}\n")
+        raise
+
     if "sections" not in result or not isinstance(result["sections"], list):
         raise RuntimeError("Result JSON missing 'sections' list.")
 
