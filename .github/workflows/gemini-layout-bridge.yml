@@ -27,10 +27,19 @@ on:
         description: Slug (optional)
         required: false
         default: ""
+      llm_model:
+        description: HF model id (optional, overrides default)
+        required: false
+        default: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 jobs:
   build-and-generate:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # Default LLM – can be overridden by workflow_dispatch input
+      GLB_LLM_MODEL: ${{ github.event.inputs.llm_model }}
 
     steps:
       - name: Checkout worker repo
@@ -38,15 +47,15 @@ jobs:
 
       - name: Show runner info
         run: |
-          echo "Node:" $(node -v || echo "not installed yet")
-          echo "npm:"  $(npm -v || echo "not installed yet")
-          echo "Python:" $(python3 --version || echo "none")
+          node -v
+          npm -v
+          python3 --version
           uname -a
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install worker Node dependencies
         run: |
@@ -55,7 +64,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Python LLM dependencies
         run: |
@@ -63,14 +72,13 @@ jobs:
           pip install "transformers==4.45.2" "accelerate" "torch>=2.2.0" --no-cache-dir
 
       - name: Pre-download LLM weights (optional but reduces first-run latency)
-        env:
-          GLB_LLM_MODEL: microsoft/Phi-3-mini-4k-instruct
         run: |
+          echo "Pre-fetching model: ${GLB_LLM_MODEL}"
           python - << 'PYCODE'
           import os
           from transformers import AutoModelForCausalLM, AutoTokenizer
 
-          model_name = os.getenv("GLB_LLM_MODEL", "microsoft/Phi-3-mini-4k-instruct")
+          model_name = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
           print(f"Pre-fetching model: {model_name}")
           tok = AutoTokenizer.from_pretrained(model_name)
           model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -95,6 +103,19 @@ jobs:
           echo "App directory contents after unzip:"
           ls -R .
 
+      - name: Debug: show primary TSX/HTML files if present
+        run: |
+          echo "Listing project tree under ./app:"
+          ls -R app || true
+
+          echo "Showing App.tsx variants (if they exist):"
+          sed -n '1,200p' app/App.tsx || true
+          sed -n '1,200p' app/src/App.tsx || true
+
+          echo "Showing index.html variants (if they exist):"
+          sed -n '1,120p' app/index.html || true
+          sed -n '1,120p' app/public/index.html || true
+
       - name: Generate layout & post back to WordPress
         env:
           JOB_ID: ${{ github.event.inputs.job_id }}
@@ -103,14 +124,17 @@ jobs:
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           PAGE_TITLE: ${{ github.event.inputs.page_title }}
           SLUG: ${{ github.event.inputs.slug }}
-          GLB_LLM_MODEL: microsoft/Phi-3-mini-4k-instruct
+          GLB_LLM_MODEL: ${{ env.GLB_LLM_MODEL }}
+          GLB_LOG_LEVEL: debug
         run: |
+          set -e
           echo "Starting layout generation with:"
           echo "  JOB_ID=$JOB_ID"
           echo "  BUILDER=$BUILDER"
           echo "  CALLBACK_URL=$CALLBACK_URL"
           echo "  PAGE_TITLE=$PAGE_TITLE"
           echo "  SLUG=$SLUG"
+          echo "  GLB_LLM_MODEL=$GLB_LLM_MODEL"
 
           node scripts/generate-layout.js \
             --job-id "$JOB_ID" \
