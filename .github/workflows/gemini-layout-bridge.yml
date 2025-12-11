@@ -1,0 +1,102 @@
+name: Gemini Layout Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job ID from WordPress
+        required: true
+      job_secret:
+        description: Shared secret from WordPress
+        required: true
+      builder:
+        description: Target builder (divi or classic)
+        required: true
+        default: divi
+      zip_url:
+        description: URL where the Gemini ZIP can be downloaded
+        required: true
+      callback_url:
+        description: WordPress REST endpoint to call with layout JSON
+        required: true
+      page_title:
+        description: Page title (optional)
+        required: false
+        default: ""
+      slug:
+        description: Slug (optional)
+        required: false
+        default: ""
+
+jobs:
+  build-and-generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout worker repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install worker Node dependencies
+        run: npm ci || npm install
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python LLM dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "transformers==4.45.2" "accelerate" "torch>=2.2.0" --no-cache-dir
+
+      - name: Pre-download LLM weights (optional but reduces first-run latency)
+        env:
+          GLB_LLM_MODEL: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        run: |
+          python - << 'PYCODE'
+          import os
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+
+          model_name = os.getenv("GLB_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+          print(f"Pre-fetching model: {model_name}")
+          tok = AutoTokenizer.from_pretrained(model_name)
+          model = AutoModelForCausalLM.from_pretrained(model_name)
+          print("Model ready.")
+          PYCODE
+
+      - name: Create app directory
+        run: mkdir app
+
+      - name: Download Gemini ZIP
+        run: |
+          curl -L "${{ github.event.inputs.zip_url }}" -o app/app.zip
+
+      - name: Unzip Gemini app
+        run: |
+          cd app
+          unzip -q app.zip
+          rm app.zip
+
+      - name: Generate layout & post back to WordPress
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          JOB_SECRET: ${{ github.event.inputs.job_secret }}
+          BUILDER: ${{ github.event.inputs.builder }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          PAGE_TITLE: ${{ github.event.inputs.page_title }}
+          SLUG: ${{ github.event.inputs.slug }}
+          GLB_LLM_MODEL: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        run: |
+          node scripts/generate-layout.js \
+            --job-id "$JOB_ID" \
+            --job-secret "$JOB_SECRET" \
+            --builder "$BUILDER" \
+            --app-dir "./app" \
+            --callback-url "$CALLBACK_URL" \
+            --page-title "$PAGE_TITLE" \
+            --slug "$SLUG"
