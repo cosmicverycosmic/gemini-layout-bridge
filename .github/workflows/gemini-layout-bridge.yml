@@ -98,7 +98,7 @@ jobs:
           echo "[GLB Worker] App directory contents after unzip:"
           ls -R .
 
-      - name: Debug: show primary TSX/HTML files if present
+      - name: Debug show primary TSX/HTML files if present
         run: |
           echo "[GLB Worker] Listing project tree under ./app:"
           ls -R app || true
