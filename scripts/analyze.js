@@ -12,30 +12,28 @@ const OUTPUT_PLUGIN = 'plugin.php';
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Enterprise Architect v13.1 (Tier 1)");
+        console.log("GLB Enterprise Architect v14.0 (Tier 1)");
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
-        // 1. Load Context & Extract Code
         if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context file missing.");
         const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
-        const context = JSON.parse(contextRaw);
 
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
         const codeSummary = generateCodeSummary('extracted_source');
         console.log(`Source Code Scanned: ${codeSummary.length} chars`);
 
-        // 2. Prepare the AI Prompt
+        // Prompt
         const systemPrompt = `
         ROLE: Expert WordPress Architect.
-        TASK: Convert the provided Frontend App into Native WordPress Layout.
         TARGET: ${args.builder}.
+        TASK: Convert React/Angular App to Native WordPress.
 
-        MAPPING RULES:
-        1. USE NATIVE MODULES: "pricing", "accordion", "hero", "blurb_grid", "video", "testimonial".
-        2. DATABASE: If code fetches data (e.g., fetch('/posts')), map to 'machine_loop' if divi_machine is true, or 'blog_grid'.
-        3. SECURITY: In custom PHP, wrap database operations in: if (!defined('GLB_PREVIEW_MODE')).
+        RULES:
+        1. Use Native Modules: "pricing", "accordion", "hero", "blurb_grid", "video".
+        2. Database: If data fetch detected, use 'machine_loop' (if divi_machine active) or 'blog_grid'.
+        3. Security: Wrap DB writes in 'if (!defined("GLB_PREVIEW_MODE"))'.
 
         OUTPUT JSON SCHEMA:
         {
@@ -43,58 +41,52 @@ async function run() {
             "custom_plugin_php": "<?php ... (full code or null) ?>"
         }`;
 
-        const userMessage = `SITE CONTEXT: ${contextRaw}\n\nAPP CODE:\n${codeSummary}`;
+        const userMessage = `CONTEXT: ${contextRaw}\n\nCODE:\n${codeSummary}`;
 
         const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) throw new Error("API Key is missing from Environment.");
+        if (!apiKey) throw new Error("GEMINI_API_KEY is missing.");
 
-        // 3. Request to Gemini 1.5 Flash (Cheapest & Fast)
-        // Using the stable production path
+        // DIRECT FETCH to Gemini 1.5 Flash (Stable v1)
+        // This avoids SDK versioning errors completely
         const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
         
-        console.log("Requesting Gemini 1.5 Flash (Production Endpoint)...");
+        console.log("Requesting Gemini 1.5 Flash...");
 
         const response = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: systemPrompt + "\n\n" + userMessage }] }],
-                generationConfig: { 
-                    response_mime_type: "application/json",
-                    temperature: 0.1 
-                }
+                generationConfig: { response_mime_type: "application/json", temperature: 0.1 }
             })
         });
 
         if (!response.ok) {
             const err = await response.json();
-            throw new Error(`API Error ${response.status}: ${err.error?.message || 'Unknown'}`);
+            throw new Error(`API Error ${response.status}: ${JSON.stringify(err)}`);
         }
 
         const data = await response.json();
         const text = data.candidates[0].content.parts[0].text;
-        console.log("✅ AI Analysis Received.");
+        
+        // Parse
+        const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        const output = JSON.parse(clean);
 
-        // 4. Clean & Parse
-        const cleanJson = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        const output = JSON.parse(cleanJson);
-
-        // 5. Save Artifacts
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(output.layout, null, 2));
         console.log(`Layout Saved: ${output.layout.sections.length} sections.`);
 
         if (output.custom_plugin_php && output.custom_plugin_php.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, output.custom_plugin_php);
-            console.log("Custom Plugin Logic Saved.");
+            console.log("Custom Plugin Saved.");
         }
 
     } catch (error) {
-        console.error("CRITICAL ARCHITECT ERROR:", error.message);
-        // Ensure WP gets an error message instead of a blank page
-        const errorLayout = {
-            sections: [{ type: 'text', props: {}, html: `<div style="padding:50px;border:2px solid red;color:red;"><h3>Architect Failed</h3><p>${error.message}</p></div>` }]
+        console.error("CRITICAL ERROR:", error.message);
+        const errJson = {
+            sections: [{ type: 'text', props: {}, html: `<div style="color:red;padding:20px;"><h3>Architect Failed</h3><p>${error.message}</p></div>` }]
         };
-        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
+        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errJson));
         process.exit(0);
     }
 }
@@ -102,7 +94,7 @@ async function run() {
 function generateCodeSummary(dir) {
     let summary = "";
     function walk(directory) {
-        if (summary.length > 400000) return;
+        if (summary.length > 500000) return; // 1M Token Limit allows large context
         const files = fs.readdirSync(directory);
         for (const file of files) {
             const fullPath = path.join(directory, file);
@@ -110,9 +102,9 @@ function generateCodeSummary(dir) {
             if (stat.isDirectory()) {
                 if (['node_modules', '.git', 'dist'].includes(file)) continue;
                 walk(fullPath);
-            } else if (file.match(/\.(js|jsx|ts|tsx|html|php)$/i)) {
+            } else if (file.match(/\.(js|jsx|ts|tsx|html|php|css)$/i)) {
                 if (file.includes('lock') || file.includes('config')) continue;
-                summary += `\n--- ${file} ---\n${fs.readFileSync(fullPath, 'utf8').replace(/\s+/g, ' ')}\n`;
+                summary += `\n--- ${file} ---\n${fs.readFileSync(fullPath, 'utf8')}\n`;
             }
         }
     }
