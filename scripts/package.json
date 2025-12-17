@@ -1,0 +1,12 @@
+{
+  "name": "glb-architect-engine",
+  "version": "9.0.0",
+  "description": "AI Engine for Gemini Layout Bridge Enterprise",
+  "main": "analyze.js",
+  "dependencies": {
+    "@google/generative-ai": "^0.2.0",
+    "adm-zip": "^0.5.10",
+    "minimist": "^1.2.8",
+    "glob": "^10.3.10"
+  }
+}
