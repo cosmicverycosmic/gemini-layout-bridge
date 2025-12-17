@@ -1,7 +1,6 @@
 {
   "name": "glb-architect-engine",
-  "version": "13.0.0",
-  "description": "Bare Metal AI Engine",
+  "version": "14.0.0",
   "main": "analyze.js",
   "dependencies": {
     "adm-zip": "^0.5.10",
