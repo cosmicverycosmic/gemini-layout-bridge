@@ -30,9 +30,13 @@ async function run() {
         console.log(`Source Code Summarized: ${codeSummary.length} chars`);
 
         // 3. Initialize Gemini
+        // IMPORTANT: Gemini 1.5 Pro requires the v1beta API version in many environments.
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        // UPDATED: Use stable model version
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+        
+        const model = genAI.getGenerativeModel({ 
+            model: "gemini-1.5-pro",
+            apiVersion: "v1beta" // Explicitly force v1beta to avoid 404 on v1
+        });
 
         // 4. Construct Engineering Prompt
         const systemPrompt = `
@@ -76,7 +80,7 @@ async function run() {
         SOURCE CODE: ${codeSummary}
         `;
 
-        console.log("Sending Analysis Request to Gemini...");
+        console.log("Sending Analysis Request to Gemini (v1beta)...");
         const result = await model.generateContent([systemPrompt, userMessage]);
         const response = result.response;
         let text = response.text();
@@ -107,11 +111,10 @@ async function run() {
             sections: [{
                 type: 'text',
                 props: {},
-                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p></div>`
+                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p><p>Check GitHub Actions logs for details.</p></div>`
             }]
         };
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
-        // Exit success so Artifact uploads the error message to WP
         process.exit(0);
     }
 }
