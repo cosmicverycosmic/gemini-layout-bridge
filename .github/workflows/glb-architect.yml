@@ -17,10 +17,11 @@ jobs:
       - uses: actions/setup-node@v3
         with: { node-version: '20' }
       
-      - name: Install
-        run: npm install adm-zip minimist
+      - name: Install Dependencies
+        working-directory: ./scripts
+        run: npm install
 
-      - name: Fetch Assets
+      - name: Fetch Secure Assets
         run: |
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
@@ -29,7 +30,7 @@ jobs:
         env: { GEMINI_API_KEY: ${{ inputs.gemini_key }} }
         run: node scripts/analyze.js --builder "${{ inputs.builder }}"
 
-      - name: Upload
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: glb-build-${{ inputs.job_id }}
