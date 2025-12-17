@@ -1,10 +1,11 @@
 {
   "name": "glb-architect-engine",
-  "version": "14.0.0",
-  "description": "Tier 1 Gemini Flash Engine",
+  "version": "13.0.0",
+  "description": "Bare Metal AI Engine",
   "main": "analyze.js",
   "dependencies": {
     "adm-zip": "^0.5.10",
-    "minimist": "^1.2.8"
+    "minimist": "^1.2.8",
+    "glob": "^10.3.10"
   }
 }
