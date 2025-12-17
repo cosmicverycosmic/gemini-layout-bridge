@@ -13,86 +13,67 @@ const OUTPUT_PLUGIN = 'plugin.php';
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Enterprise Architect v9.0");
+        console.log("GLB Enterprise Architect v9.1");
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
-        // 1. Load Site Context
-        if (!fs.existsSync(CONTEXT_FILE)) {
-            throw new Error("Context file missing.");
-        }
+        // 1. Load Context
+        if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context file missing.");
         const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
         const context = JSON.parse(contextRaw);
-        console.log(`Context Loaded for: ${context.site_name}`);
+        console.log(`Context Loaded: ${context.site_name}`);
 
-        // 2. Extract and Summarize Source Code
+        // 2. Extract Source
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
         const codeSummary = generateCodeSummary('extracted_source');
-        console.log(`Source Code Summarized. Length: ${codeSummary.length} chars`);
+        console.log(`Source Code Summarized: ${codeSummary.length} chars`);
 
         // 3. Initialize Gemini
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        // Using Pro model for better code generation capabilities
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
+        // UPDATED: Use stable model version
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
-        // 4. Construct the Engineering Prompt
+        // 4. Construct Engineering Prompt
         const systemPrompt = `
-        YOU ARE: A Senior WordPress Full-Stack Architect & Security Engineer.
+        YOU ARE: A Senior WordPress Layout Architect.
+        TARGET BUILDER: ${args.builder}.
         
-        INPUTS:
-        1. Modern Frontend Source Code (React/Angular/Vue).
-        2. WordPress Site Inventory (Plugins, Assets, DB Capabilities).
-        3. Target Builder: ${args.builder}.
+        TASK: Convert React/Angular Code to Native WordPress Builder Modules.
         
-        YOUR GOAL: 
-        Convert the App into a native WordPress implementation.
+        CRITICAL RULES FOR DIVI/ELEMENTOR:
+        1. **AVOID RAW HTML**. Use specific module types whenever possible.
+        2. **Pricing Tables**: Detect pricing lists and map to type "pricing".
+        3. **FAQs/Toggles**: Detect question/answer lists and map to type "accordion".
+        4. **Feature Grids**: Detect icons+text grids and map to type "blurb_grid".
+        5. **Video**: Detect youtube/vimeo iframes and map to type "video".
+        6. **Testimonials**: Detect quotes and map to type "testimonial".
         
-        ---
-        
-        PHASE 1: LAYOUT MAPPING (JSON)
-        Map the UI components to WordPress modules based on the Inventory.
-        
-        ECOSYSTEM RULES (PRIORITY HIGH):
-        - If 'divi_machine' is true: Use 'machine_loop' type for any data lists/grids.
-        - If 'divi_next' is true: Use 'next_tilt' for cards with hover effects.
-        - If 'dp_carousel' is true: Use 'dp_slider' for carousels.
-        - If 'gravity_forms' is true: Use 'contact_form' type mapped to gravity shortcodes.
-        - If 'woocommerce' is true: Map product grids to 'shop_grid'.
-        - If 'menus' are available: Map navbars to 'menu' type using the slug.
-        
-        PHASE 2: CUSTOM PLUGIN ENGINEERING (PHP)
-        If the App contains logic that CANNOT be achieved with existing plugins (e.g., Mortgage Calculator, Task Database, Custom API integrations), you must WRITE A WORDPRESS PLUGIN to handle it.
-        
-        PHP SECURITY RULES:
-        1. Nonces: Verify nonces on all form submissions.
-        2. Sanitization: Use sanitize_text_field, sanitize_email, etc.
-        3. Escape: Use esc_html, esc_attr on output.
-        4. **SANDBOX PROTOCOL**: Wrap ALL database write operations (wp_insert_post, $wpdb->insert) in this check:
-           if ( ! defined( 'GLB_PREVIEW_MODE' ) ) { ... }
-           This allows the code to be previewed safely without modifying the DB.
+        ECOSYSTEM RULES:
+        - If 'divi_machine' is true in context: Use 'machine_loop' for dynamic data.
+        - If 'woocommerce' is true: Use 'shop_grid' for products.
         
         OUTPUT FORMAT (Strict JSON):
         {
             "layout": {
                 "sections": [
                     { 
-                        "type": "hero|machine_loop|next_tilt|shop_grid|contact_form|custom_shortcode|text", 
-                        "props": { "title": "...", "shortcode": "[glb_calc]" }, 
-                        "html": "fallback html" 
+                        "type": "hero|pricing|accordion|blurb_grid|video|testimonial|shop_grid|contact_form|text", 
+                        "props": { 
+                            "title": "...", 
+                            "items": [ {"title":"Basic", "price":"$10", "features":["A","B"]} ]
+                        }, 
+                        "html": "fallback html only if complex" 
                     }
                 ]
             },
-            "custom_plugin_php": "<?php ... full valid plugin code including header ... ?>"
+            "custom_plugin_php": "<?php ... ?>"
         }
         `;
 
         const userMessage = `
-        SITE CONTEXT:
-        ${contextRaw}
-
-        SOURCE CODE SUMMARY:
-        ${codeSummary}
+        SITE CONTEXT: ${contextRaw}
+        SOURCE CODE: ${codeSummary}
         `;
 
         console.log("Sending Analysis Request to Gemini...");
@@ -100,81 +81,64 @@ async function run() {
         const response = result.response;
         let text = response.text();
 
-        // Clean Markdown formatting if Gemini adds it
+        // Clean Markdown
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
-        // Parse Response
+        // Parse
         let data;
         try {
             data = JSON.parse(text);
         } catch (e) {
-            console.error("Failed to parse JSON response from Gemini. Raw text:", text);
+            console.error("JSON Parse Error. Raw text:", text);
             throw new Error("Invalid JSON from AI");
         }
 
-        // Save Layout
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(data.layout, null, 2));
         console.log(`Generated Layout: ${data.layout.sections.length} sections.`);
 
-        // Save Plugin if exists
         if (data.custom_plugin_php && data.custom_plugin_php.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, data.custom_plugin_php);
-            console.log("Generated Custom Plugin: plugin.php saved.");
-        } else {
-            console.log("No custom plugin logic required.");
         }
 
     } catch (error) {
-        console.error("CRITICAL ARCHITECT ERROR:", error);
+        console.error("ARCHITECT ERROR:", error);
         // Fallback Error Layout
         const errorLayout = {
             sections: [{
                 type: 'text',
                 props: {},
-                html: `<div style="padding:50px;text-align:center;color:red;border:1px solid red;"><h3>AI Analysis Failed</h3><p>${error.message}</p></div>`
+                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p></div>`
             }]
         };
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
+        // Exit success so Artifact uploads the error message to WP
         process.exit(0);
     }
 }
 
-/**
- * Scans directory for source code, skipping node_modules and assets.
- * Returns a concatenated string of relevant code files.
- */
 function generateCodeSummary(dir) {
     let summary = "";
-    const MAX_CHARS = 100000; // Large context window allowed
+    const MAX_CHARS = 100000;
     
     function walk(directory) {
         if (summary.length >= MAX_CHARS) return;
-        
         const files = fs.readdirSync(directory);
         for (const file of files) {
             const fullPath = path.join(directory, file);
             const stat = fs.statSync(fullPath);
 
             if (stat.isDirectory()) {
-                if (['node_modules', '.git', 'build', 'dist', 'assets', 'images', 'vendor'].includes(file)) continue;
+                if (['node_modules', '.git', 'build', 'dist', 'assets', 'images'].includes(file)) continue;
                 walk(fullPath);
             } else {
-                // Only read Logic/UI files
                 if (file.match(/\.(js|jsx|ts|tsx|html|vue|php)$/i)) {
-                    // Skip test/config files to save tokens
-                    if (file.includes('test') || file.includes('spec') || file.includes('config')) continue;
-                    
+                    if (file.includes('test') || file.includes('spec')) continue;
                     const content = fs.readFileSync(fullPath, 'utf8');
-                    // Simple whitespace minification
-                    const cleanContent = content.replace(/\s+/g, ' ');
-                    
-                    summary += `\n--- FILE: ${file} ---\n${cleanContent}\n`;
-                    if (summary.length >= MAX_CHARS) break;
+                    summary += `\n--- FILE: ${file} ---\n${content.replace(/\s+/g, ' ')}\n`;
                 }
             }
         }
     }
-
     walk(dir);
     return summary;
 }
