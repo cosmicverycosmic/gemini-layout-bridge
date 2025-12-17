@@ -3,58 +3,43 @@ name: GLB Enterprise Architect
 on:
   workflow_dispatch:
     inputs:
-      job_id:
-        description: 'Unique Job ID'
-        required: true
-      zip_url:
-        description: 'Secure Source Code Download URL'
-        required: true
-      ctx_url:
-        description: 'Secure Context/Inventory Download URL'
-        required: true
-      builder:
-        description: 'Target Builder (divi, elementor, etc)'
-        required: true
+      job_id: { required: true }
+      zip_url: { required: true }
+      ctx_url: { required: true }
+      builder: { required: true }
+      gemini_key: { required: true }
 
 jobs:
   architect-build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with: { node-version: '20' }
+      
+      - name: Install
+        run: npm install adm-zip minimist
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '20'
-
-      - name: Install Dependencies
-        working-directory: ./scripts
-        run: npm install
-
-      - name: Fetch Secure Assets
+      - name: Fetch
         run: |
-          echo "Downloading assets from WordPress..."
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
-      - name: Execute AI Architect
+      - name: Run AI Architect
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          node scripts/analyze.js \
-            --job_id "${{ inputs.job_id }}" \
-            --builder "${{ inputs.builder }}"
+          GEMINI_API_KEY: ${{ inputs.gemini_key }}
+        run: node scripts/analyze.js --builder "${{ inputs.builder }}"
 
-      - name: Package Artifacts
+      - name: PHP Lint
+        run: |
+          if [ -f plugin.php ]; then
+             php -l plugin.php || exit 1
+          fi
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: glb-build-${{ inputs.job_id }}
           path: |
             layout.json
             plugin.php
-          retention-days: 1
