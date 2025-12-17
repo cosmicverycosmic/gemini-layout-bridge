@@ -10,10 +10,19 @@ const CONTEXT_FILE = 'context.json';
 const OUTPUT_LAYOUT = 'layout.json';
 const OUTPUT_PLUGIN = 'plugin.php';
 
+// The "Ladder" - The script will try these in order until one works.
+const MODEL_LADDER = [
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro",
+    "gemini-1.5-pro-latest",
+    "gemini-pro" // The "Old Reliable" fallback (v1.0)
+];
+
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Enterprise Architect v9.2");
+        console.log("GLB Enterprise Architect v9.3 (Ladder)");
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
@@ -26,17 +35,9 @@ async function run() {
         // 2. Extract Source
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
-        const codeSummary = generateCodeSummary('extracted_source');
-        console.log(`Source Code Summarized: ${codeSummary.length} chars`);
-
-        // 3. Initialize Gemini
+        
+        // 3. Initialize Gemini Client
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        
-        // PRIMARY FIX: Use 'gemini-1.5-flash' which is the most stable/available model
-        const MODEL_NAME = "gemini-1.5-flash"; 
-        
-        console.log(`Initializing Model: ${MODEL_NAME}...`);
-        const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
         // 4. Construct Engineering Prompt
         const systemPrompt = `
@@ -51,7 +52,6 @@ async function run() {
         3. **FAQs/Toggles**: Detect question/answer lists and map to type "accordion".
         4. **Feature Grids**: Detect icons+text grids and map to type "blurb_grid".
         5. **Video**: Detect youtube/vimeo iframes and map to type "video".
-        6. **Testimonials**: Detect quotes and map to type "testimonial".
         
         ECOSYSTEM RULES:
         - If 'divi_machine' is true in context: Use 'machine_loop' for dynamic data.
@@ -75,21 +75,41 @@ async function run() {
         }
         `;
 
-        const userMessage = `
-        SITE CONTEXT: ${contextRaw}
-        SOURCE CODE: ${codeSummary}
-        `;
+        // 5. Try Models in Sequence
+        let result = null;
+        let usedModel = "";
 
-        console.log("Sending Analysis Request...");
-        
-        let result;
-        try {
-            result = await model.generateContent([systemPrompt, userMessage]);
-        } catch (apiError) {
-            console.warn(`Primary model ${MODEL_NAME} failed: ${apiError.message}`);
-            console.log("Attempting fallback to 'gemini-1.5-flash-latest'...");
-            const fallbackModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
-            result = await fallbackModel.generateContent([systemPrompt, userMessage]);
+        for (const modelName of MODEL_LADDER) {
+            console.log(`Attempting Model: ${modelName}...`);
+            try {
+                // Adjust context size based on model capability
+                // 1.5 models = 1M tokens (huge)
+                // gemini-pro (1.0) = 30k tokens (small)
+                const isLegacy = modelName.includes("gemini-pro") && !modelName.includes("1.5");
+                const maxChars = isLegacy ? 25000 : 300000;
+                
+                const codeSummary = generateCodeSummary('extracted_source', maxChars);
+                if(isLegacy) console.log(`Legacy Model detected. Truncated source to ${maxChars} chars.`);
+
+                const userMessage = `
+                SITE CONTEXT: ${contextRaw}
+                SOURCE CODE: ${codeSummary}
+                `;
+
+                const model = genAI.getGenerativeModel({ model: modelName });
+                result = await model.generateContent([systemPrompt, userMessage]);
+                usedModel = modelName;
+                console.log("✅ Success!");
+                break; // Stop loop on success
+
+            } catch (e) {
+                console.warn(`❌ ${modelName} Failed: ${e.message.split(':')[0]} (404/400)`);
+                // Continue to next model
+            }
+        }
+
+        if (!result) {
+            throw new Error("All AI Models failed. Check API Key permissions.");
         }
 
         const response = result.response;
@@ -108,18 +128,15 @@ async function run() {
         }
 
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(data.layout, null, 2));
-        console.log(`Generated Layout: ${data.layout.sections.length} sections.`);
+        console.log(`Generated Layout using ${usedModel}: ${data.layout.sections.length} sections.`);
 
         if (data.custom_plugin_php && data.custom_plugin_php.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, data.custom_plugin_php);
             console.log("Custom Plugin PHP generated.");
-        } else {
-            console.log("No custom plugin required.");
         }
 
     } catch (error) {
-        console.error("ARCHITECT ERROR:", error);
-        // Fallback Error Layout
+        console.error("CRITICAL ERROR:", error);
         const errorLayout = {
             sections: [{
                 type: 'text',
@@ -128,17 +145,15 @@ async function run() {
             }]
         };
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
-        // Exit 0 to allow artifact upload
         process.exit(0);
     }
 }
 
-function generateCodeSummary(dir) {
+function generateCodeSummary(dir, maxChars) {
     let summary = "";
-    const MAX_CHARS = 300000; // Flash has huge context, we can increase this
     
     function walk(directory) {
-        if (summary.length >= MAX_CHARS) return;
+        if (summary.length >= maxChars) return;
         const files = fs.readdirSync(directory);
         for (const file of files) {
             const fullPath = path.join(directory, file);
@@ -151,7 +166,9 @@ function generateCodeSummary(dir) {
                 if (file.match(/\.(js|jsx|ts|tsx|html|vue|php)$/i)) {
                     if (file.includes('test') || file.includes('spec')) continue;
                     const content = fs.readFileSync(fullPath, 'utf8');
-                    summary += `\n--- FILE: ${file} ---\n${content.replace(/\s+/g, ' ')}\n`;
+                    // Aggressive minification to fit legacy models
+                    const clean = content.replace(/\s+/g, ' ').substring(0, 5000); 
+                    summary += `\n--- ${file} ---\n${clean}\n`;
                 }
             }
         }
