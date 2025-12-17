@@ -1,7 +1,6 @@
 {
   "name": "glb-architect-engine",
-  "version": "10.0.0",
-  "description": "AI Engine using GitHub Models (Free Tier)",
+  "version": "12.0.0",
   "main": "analyze.js",
   "dependencies": {
     "openai": "^4.0.0",
