@@ -4,14 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
+        description: 'Unique Job ID'
         required: true
       zip_url:
+        description: 'Secure Source Code Download URL'
         required: true
       ctx_url:
+        description: 'Secure Context/Inventory Download URL'
         required: true
       builder:
+        description: 'Target Builder (divi, elementor, etc)'
         required: true
-      # gemini_key is NO LONGER NEEDED
 
 jobs:
   architect-build:
@@ -35,12 +38,12 @@ jobs:
 
       - name: Fetch Secure Assets
         run: |
+          echo "Downloading assets from WordPress..."
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
       - name: Execute AI Architect
         env:
-          # Use the built-in token for free AI access
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/analyze.js \
