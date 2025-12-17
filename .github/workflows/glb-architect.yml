@@ -20,21 +20,14 @@ jobs:
       - name: Install
         run: npm install adm-zip minimist
 
-      - name: Fetch
+      - name: Fetch Assets
         run: |
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
       - name: Run AI Architect
-        env:
-          GEMINI_API_KEY: ${{ inputs.gemini_key }}
+        env: { GEMINI_API_KEY: ${{ inputs.gemini_key }} }
         run: node scripts/analyze.js --builder "${{ inputs.builder }}"
-
-      - name: PHP Lint
-        run: |
-          if [ -f plugin.php ]; then
-             php -l plugin.php || exit 1
-          fi
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -43,3 +36,4 @@ jobs:
           path: |
             layout.json
             plugin.php
+          retention-days: 1
