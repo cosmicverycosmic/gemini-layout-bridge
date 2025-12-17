@@ -13,7 +13,7 @@ const OUTPUT_PLUGIN = 'plugin.php';
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Architect v10 (GitHub Models Edition)");
+        console.log("GLB Architect v10 (GitHub Models)");
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
@@ -28,9 +28,8 @@ async function run() {
         console.log(`Source Code Scanned: ${codeSummary.length} chars`);
 
         // 3. Initialize GitHub Models Client
-        // We use the OpenAI SDK but point it to GitHub's endpoint
         const token = process.env.GITHUB_TOKEN;
-        if (!token) throw new Error("GITHUB_TOKEN is missing. Ensure it is passed in the workflow.");
+        if (!token) throw new Error("GITHUB_TOKEN is missing.");
 
         const client = new OpenAI({
             baseURL: "https://models.inference.ai.azure.com",
@@ -45,7 +44,7 @@ async function run() {
         TASK: Map React/Angular source code to a Native WordPress Layout.
         
         CRITICAL RULES:
-        1. **Native Modules**: Use specific types like "pricing", "accordion", "hero", "blurb_grid", "video".
+        1. **Native Modules**: Use specific types like "pricing", "accordion", "hero", "blurb_grid", "video", "testimonial".
         2. **Ecosystem**: If 'divi_machine' is active, use 'machine_loop'. If 'woocommerce', use 'shop_grid'.
         3. **Security**: Wrap DB writes in 'if (!defined("GLB_PREVIEW_MODE"))'.
         
@@ -53,10 +52,10 @@ async function run() {
         {
             "layout": {
                 "sections": [
-                    { "type": "hero|pricing|text", "props": {...}, "html": "..." }
+                    { "type": "hero|pricing|text", "props": {"title":"..."}, "html": "..." }
                 ]
             },
-            "custom_plugin_php": "<?php ..."
+            "custom_plugin_php": "<?php ... ?>"
         }`;
 
         const userMessage = `
@@ -65,17 +64,17 @@ async function run() {
         ${codeSummary}
         `;
 
-        console.log("Sending to GitHub Models (GPT-4o)...");
+        console.log("Sending to GitHub Models (gpt-4o)...");
 
         const response = await client.chat.completions.create({
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userMessage }
             ],
-            model: "gpt-4o", // Free tier available via GitHub Models
+            model: "gpt-4o",
             temperature: 0.1,
             max_tokens: 4096,
-            response_format: { type: "json_object" } // Force JSON
+            response_format: { type: "json_object" }
         });
 
         const text = response.choices[0].message.content;
@@ -109,7 +108,7 @@ async function run() {
 
 function generateCodeSummary(dir) {
     let summary = "";
-    // GitHub Models (GPT-4o) has 128k context, so we can be generous
+    // GitHub Models limit context
     const MAX_CHARS = 100000; 
     
     function walk(directory) {
@@ -120,10 +119,13 @@ function generateCodeSummary(dir) {
             const stat = fs.statSync(fullPath);
 
             if (stat.isDirectory()) {
-                if (['node_modules', '.git', 'build', 'dist', 'assets'].includes(file)) continue;
+                if (['node_modules', '.git', 'build', 'dist', 'assets', 'vendor'].includes(file)) continue;
                 walk(fullPath);
             } else {
                 if (file.match(/\.(js|jsx|ts|tsx|html|php)$/i)) {
+                    // Skip large config files
+                    if(file.includes('lock') || file.includes('config')) continue;
+                    
                     const content = fs.readFileSync(fullPath, 'utf8');
                     summary += `\n--- ${file} ---\n${content.replace(/\s+/g, ' ')}\n`;
                 }
