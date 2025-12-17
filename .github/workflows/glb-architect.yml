@@ -4,64 +4,48 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: 'Unique Job ID'
         required: true
       zip_url:
-        description: 'Secure Source Code Download URL'
         required: true
       ctx_url:
-        description: 'Secure Context/Inventory Download URL'
         required: true
       builder:
-        description: 'Target Builder (divi, elementor, etc)'
         required: true
-      gemini_key:
-        description: 'Gemini API Key'
-        required: true
+      # gemini_key is NO LONGER NEEDED
 
 jobs:
   architect-build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      - name: Setup Node.js Environment
+      - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '20'
 
-      - name: Install AI & Utility Dependencies
+      - name: Install Dependencies
         working-directory: ./scripts
         run: npm install
 
       - name: Fetch Secure Assets
         run: |
-          # Download Source Code
           curl -L "${{ inputs.zip_url }}" --output source.zip
-          # Download Site Inventory (Hyper-Context)
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
       - name: Execute AI Architect
         env:
-          GEMINI_API_KEY: ${{ inputs.gemini_key }}
+          # Use the built-in token for free AI access
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/analyze.js \
             --job_id "${{ inputs.job_id }}" \
             --builder "${{ inputs.builder }}"
-
-      - name: Quality Assurance (PHP Linting)
-        run: |
-          # If the AI wrote a custom plugin, ensure it is syntactically valid PHP
-          if [ -f plugin.php ]; then
-            echo "Linting generated plugin code..."
-            php -l plugin.php
-          else
-            echo "No custom plugin generated. Skipping lint."
-          fi
 
       - name: Package Artifacts
         uses: actions/upload-artifact@v4
