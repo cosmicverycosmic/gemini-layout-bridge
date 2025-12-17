@@ -13,7 +13,7 @@ const OUTPUT_PLUGIN = 'plugin.php';
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Enterprise Architect v9.1");
+        console.log("GLB Enterprise Architect v9.2");
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
@@ -21,7 +21,7 @@ async function run() {
         if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context file missing.");
         const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
         const context = JSON.parse(contextRaw);
-        console.log(`Context Loaded: ${context.site_name}`);
+        console.log(`Context Loaded: ${context.site_name || 'WP Site'}`);
 
         // 2. Extract Source
         const zip = new AdmZip(SOURCE_ZIP);
@@ -30,13 +30,13 @@ async function run() {
         console.log(`Source Code Summarized: ${codeSummary.length} chars`);
 
         // 3. Initialize Gemini
-        // IMPORTANT: Gemini 1.5 Pro requires the v1beta API version in many environments.
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
         
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-1.5-pro",
-            apiVersion: "v1beta" // Explicitly force v1beta to avoid 404 on v1
-        });
+        // PRIMARY FIX: Use 'gemini-1.5-flash' which is the most stable/available model
+        const MODEL_NAME = "gemini-1.5-flash"; 
+        
+        console.log(`Initializing Model: ${MODEL_NAME}...`);
+        const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
         // 4. Construct Engineering Prompt
         const systemPrompt = `
@@ -80,8 +80,18 @@ async function run() {
         SOURCE CODE: ${codeSummary}
         `;
 
-        console.log("Sending Analysis Request to Gemini (v1beta)...");
-        const result = await model.generateContent([systemPrompt, userMessage]);
+        console.log("Sending Analysis Request...");
+        
+        let result;
+        try {
+            result = await model.generateContent([systemPrompt, userMessage]);
+        } catch (apiError) {
+            console.warn(`Primary model ${MODEL_NAME} failed: ${apiError.message}`);
+            console.log("Attempting fallback to 'gemini-1.5-flash-latest'...");
+            const fallbackModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+            result = await fallbackModel.generateContent([systemPrompt, userMessage]);
+        }
+
         const response = result.response;
         let text = response.text();
 
@@ -102,6 +112,9 @@ async function run() {
 
         if (data.custom_plugin_php && data.custom_plugin_php.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, data.custom_plugin_php);
+            console.log("Custom Plugin PHP generated.");
+        } else {
+            console.log("No custom plugin required.");
         }
 
     } catch (error) {
@@ -111,17 +124,18 @@ async function run() {
             sections: [{
                 type: 'text',
                 props: {},
-                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p><p>Check GitHub Actions logs for details.</p></div>`
+                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p></div>`
             }]
         };
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
+        // Exit 0 to allow artifact upload
         process.exit(0);
     }
 }
 
 function generateCodeSummary(dir) {
     let summary = "";
-    const MAX_CHARS = 100000;
+    const MAX_CHARS = 300000; // Flash has huge context, we can increase this
     
     function walk(directory) {
         if (summary.length >= MAX_CHARS) return;
