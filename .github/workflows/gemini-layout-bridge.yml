@@ -1,140 +1,54 @@
-name: Gemini Layout Worker
+name: GLB Enterprise Architect
 
 on:
   workflow_dispatch:
     inputs:
-      job_id:
-        description: Job ID from WordPress
-        required: true
-      job_secret:
-        description: Shared secret from WordPress
-        required: true
-      builder:
-        description: Target builder (divi or classic)
-        required: true
-        default: divi
-      zip_url:
-        description: URL where the Gemini ZIP can be downloaded
-        required: true
-      callback_url:
-        description: WordPress REST endpoint to call with layout JSON
-        required: true
-      page_title:
-        description: Page title (optional)
-        required: false
-        default: ""
-      slug:
-        description: Slug (optional)
-        required: false
-        default: ""
+      job_id: { required: true }
+      zip_url: { required: true }
+      ctx_url: { required: true }
+      builder: { required: true }
 
 jobs:
-  build-and-generate:
+  architect-build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      packages: read
+    
     steps:
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-
-      - name: Show runner info
-        run: |
-          echo "[GLB Worker] Runner info:"
-          node -v
-          npm -v
-          python3 --version
-          uname -a
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
-          node-version: "20"
+          node-version: '20'
 
-      - name: Install worker Node dependencies
+      - name: Install Dependencies
+        working-directory: ./scripts
+        run: npm install
+
+      - name: Fetch Secure Assets
         run: |
-          echo "[GLB Worker] Installing Node deps…"
-          npm ci || npm install
+          curl -L "${{ inputs.zip_url }}" --output source.zip
+          curl -L "${{ inputs.ctx_url }}" --output context.json
+        
+      - name: Execute AI Architect
+        env:
+          # This token is automatically provided by GitHub Actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/analyze.js --builder "${{ inputs.builder }}"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: PHP Lint
+        run: |
+          if [ -f plugin.php ]; then
+             php -l plugin.php || exit 1
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
-          python-version: "3.11"
-
-      - name: Install Python LLM dependencies
-        run: |
-          echo "[GLB Worker] Installing Python LLM deps…"
-          python -m pip install --upgrade pip
-          pip install "transformers==4.45.2" "accelerate" "torch>=2.2.0" --no-cache-dir
-
-      - name: Pre-download LLM weights (optional but reduces first-run latency)
-        env:
-          GLB_LLM_MODEL: microsoft/Phi-3-mini-4k-instruct
-        run: |
-          python - << 'PYCODE'
-          import os
-          from transformers import AutoModelForCausalLM, AutoTokenizer
-
-          model_name = os.getenv("GLB_LLM_MODEL", "microsoft/Phi-3-mini-4k-instruct")
-          print(f"[GLB Worker] Pre-fetching model: {model_name}")
-          tok = AutoTokenizer.from_pretrained(model_name)
-          model = AutoModelForCausalLM.from_pretrained(model_name)
-          print("[GLB Worker] Model ready.")
-          PYCODE
-
-      - name: Create app directory
-        run: mkdir app
-
-      - name: Download Gemini ZIP
-        run: |
-          echo "[GLB Worker] Downloading ZIP from: ${{ github.event.inputs.zip_url }}"
-          curl -L "${{ github.event.inputs.zip_url }}" -o app/app.zip
-          echo "[GLB Worker] Contents of ./app after download:"
-          ls -lh app
-
-      - name: Unzip Gemini app
-        run: |
-          cd app
-          unzip -q app.zip
-          rm app.zip
-          echo "[GLB Worker] App directory contents after unzip:"
-          ls -R .
-
-      - name: Debug show primary TSX/HTML files if present
-        run: |
-          echo "[GLB Worker] Listing project tree under ./app:"
-          ls -R app || true
-
-          echo "[GLB Worker] Showing App.tsx variants (if they exist):"
-          sed -n '1,200p' app/App.tsx || true
-          sed -n '1,200p' app/src/App.tsx || true
-
-          echo "[GLB Worker] Showing index.html variants (if they exist):"
-          sed -n '1,120p' app/index.html || true
-          sed -n '1,120p' app/public/index.html || true
-
-      - name: Generate layout & post back to WordPress
-        env:
-          JOB_ID: ${{ github.event.inputs.job_id }}
-          JOB_SECRET: ${{ github.event.inputs.job_secret }}
-          BUILDER: ${{ github.event.inputs.builder }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
-          PAGE_TITLE: ${{ github.event.inputs.page_title }}
-          SLUG: ${{ github.event.inputs.slug }}
-          GLB_LLM_MODEL: microsoft/Phi-3-mini-4k-instruct
-          GLB_LOG_LEVEL: debug
-        run: |
-          set -e
-          echo "[GLB Worker] Starting layout generation with:"
-          echo "  JOB_ID=$JOB_ID"
-          echo "  BUILDER=$BUILDER"
-          echo "  CALLBACK_URL=$CALLBACK_URL"
-          echo "  PAGE_TITLE=$PAGE_TITLE"
-          echo "  SLUG=$SLUG"
-
-          node scripts/generate-layout.js \
-            --job-id "$JOB_ID" \
-            --job-secret "$JOB_SECRET" \
-            --builder "$BUILDER" \
-            --app-dir "./app" \
-            --callback-url "$CALLBACK_URL" \
-            --page-title "$PAGE_TITLE" \
-            --slug "$SLUG"
+          name: glb-build-${{ inputs.job_id }}
+          path: |
+            layout.json
+            plugin.php
