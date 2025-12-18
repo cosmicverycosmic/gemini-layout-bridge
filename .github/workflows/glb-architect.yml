@@ -1,34 +1,63 @@
 name: GLB Enterprise Architect
 
 on:
+  # This section IS REQUIRED for the WordPress plugin to trigger the action
   workflow_dispatch:
     inputs:
-      job_id: { required: true }
-      zip_url: { required: true }
-      ctx_url: { required: true }
-      builder: { required: true }
-      gemini_key: { required: true }
+      job_id:
+        description: 'Job ID'
+        required: true
+      zip_url:
+        description: 'Source ZIP URL'
+        required: true
+      ctx_url:
+        description: 'Context JSON URL'
+        required: true
+      builder:
+        description: 'Target Builder'
+        required: true
+      gemini_key:
+        description: 'Google AI Key'
+        required: true
 
 jobs:
   architect-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with: { node-version: '20' }
-      
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
       - name: Install Dependencies
         working-directory: ./scripts
         run: npm install
 
-      - name: Fetch Secure Assets
+      - name: Fetch Assets
         run: |
+          echo "Downloading secure assets..."
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
       - name: Run AI Architect
-        env: { GEMINI_API_KEY: ${{ inputs.gemini_key }} }
-        run: node scripts/analyze.js --builder "${{ inputs.builder }}"
+        env:
+          GEMINI_API_KEY: ${{ inputs.gemini_key }}
+        run: |
+          node scripts/analyze.js \
+            --job_id "${{ inputs.job_id }}" \
+            --builder "${{ inputs.builder }}"
+
+      - name: PHP Syntax Check
+        run: |
+          if [ -f plugin.php ]; then
+             php -l plugin.php
+          fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
