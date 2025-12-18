@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const AdmZip = require('adm-zip');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const args = require('minimist')(process.argv.slice(2));
 
 // File Constants
@@ -10,132 +9,116 @@ const CONTEXT_FILE = 'context.json';
 const OUTPUT_LAYOUT = 'layout.json';
 const OUTPUT_PLUGIN = 'plugin.php';
 
+// Model Configuration
+// Using the specific 2.0 Flash Lite Preview endpoint
+const MODEL_NAME = "gemini-2.0-flash-lite-preview-02-05";
+const API_VERSION = "v1beta"; 
+
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log("GLB Enterprise Architect v9.2");
+        console.log(`GLB Architect (Model: ${MODEL_NAME})`);
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
-        // 1. Load Context
+        // 1. Validate Inputs
         if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context file missing.");
         const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
-        const context = JSON.parse(contextRaw);
-        console.log(`Context Loaded: ${context.site_name || 'WP Site'}`);
-
-        // 2. Extract Source
+        
+        // 2. Extract Source Code
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
         const codeSummary = generateCodeSummary('extracted_source');
-        console.log(`Source Code Summarized: ${codeSummary.length} chars`);
+        console.log(`Source Code Scanned: ${codeSummary.length} chars`);
 
-        // 3. Initialize Gemini
-        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        
-        // PRIMARY FIX: Use 'gemini-1.5-flash' which is the most stable/available model
-        const MODEL_NAME = "gemini-1.5-flash"; 
-        
-        console.log(`Initializing Model: ${MODEL_NAME}...`);
-        const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+        // 3. Prepare AI Request
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) throw new Error("GEMINI_API_KEY is missing.");
 
-        // 4. Construct Engineering Prompt
         const systemPrompt = `
-        YOU ARE: A Senior WordPress Layout Architect.
+        ROLE: Expert WordPress Architect.
         TARGET BUILDER: ${args.builder}.
-        
-        TASK: Convert React/Angular Code to Native WordPress Builder Modules.
-        
-        CRITICAL RULES FOR DIVI/ELEMENTOR:
-        1. **AVOID RAW HTML**. Use specific module types whenever possible.
-        2. **Pricing Tables**: Detect pricing lists and map to type "pricing".
-        3. **FAQs/Toggles**: Detect question/answer lists and map to type "accordion".
-        4. **Feature Grids**: Detect icons+text grids and map to type "blurb_grid".
-        5. **Video**: Detect youtube/vimeo iframes and map to type "video".
-        6. **Testimonials**: Detect quotes and map to type "testimonial".
-        
-        ECOSYSTEM RULES:
-        - If 'divi_machine' is true in context: Use 'machine_loop' for dynamic data.
-        - If 'woocommerce' is true: Use 'shop_grid' for products.
-        
-        OUTPUT FORMAT (Strict JSON):
+        TASK: Convert React/Angular App to Native WordPress Layouts.
+
+        RULES:
+        1. **Modules**: Use native modules where possible (e.g., "pricing", "accordion", "hero", "blurb_grid", "video").
+        2. **Ecosystem**: If 'divi_machine' is active, use 'machine_loop'. If 'woocommerce', use 'shop_grid'.
+        3. **Security**: Wrap DB writes in 'if (!defined("GLB_PREVIEW_MODE"))'.
+
+        OUTPUT JSON SCHEMA:
         {
-            "layout": {
-                "sections": [
-                    { 
-                        "type": "hero|pricing|accordion|blurb_grid|video|testimonial|shop_grid|contact_form|text", 
-                        "props": { 
-                            "title": "...", 
-                            "items": [ {"title":"Basic", "price":"$10", "features":["A","B"]} ]
-                        }, 
-                        "html": "fallback html only if complex" 
-                    }
-                ]
-            },
-            "custom_plugin_php": "<?php ... ?>"
-        }
-        `;
+            "layout": { "sections": [ { "type": "hero|pricing|text", "props": {}, "html": "..." } ] },
+            "custom_plugin_php": "<?php ... (full code or null) ?>"
+        }`;
 
-        const userMessage = `
-        SITE CONTEXT: ${contextRaw}
-        SOURCE CODE: ${codeSummary}
-        `;
+        const userMessage = `CONTEXT: ${contextRaw}\n\nCODE:\n${codeSummary}`;
 
-        console.log("Sending Analysis Request...");
+        // 4. Raw REST Fetch (Bypassing SDK issues)
+        const url = `https://generativelanguage.googleapis.com/${API_VERSION}/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
         
-        let result;
-        try {
-            result = await model.generateContent([systemPrompt, userMessage]);
-        } catch (apiError) {
-            console.warn(`Primary model ${MODEL_NAME} failed: ${apiError.message}`);
-            console.log("Attempting fallback to 'gemini-1.5-flash-latest'...");
-            const fallbackModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
-            result = await fallbackModel.generateContent([systemPrompt, userMessage]);
+        console.log(`Sending request to ${MODEL_NAME}...`);
+
+        const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: systemPrompt + "\n\n" + userMessage }] }],
+                generationConfig: { 
+                    response_mime_type: "application/json",
+                    temperature: 0.1 
+                }
+            })
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text();
+            throw new Error(`Gemini API Error (${response.status}): ${errBody}`);
         }
 
-        const response = result.response;
-        let text = response.text();
+        const data = await response.json();
+        
+        // 5. Parse Response
+        if (!data.candidates || !data.candidates[0].content) {
+            throw new Error("Empty response from AI model.");
+        }
 
-        // Clean Markdown
-        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-
-        // Parse
-        let data;
+        const rawText = data.candidates[0].content.parts[0].text;
+        const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+        
+        let output;
         try {
-            data = JSON.parse(text);
+            output = JSON.parse(cleanJson);
         } catch (e) {
-            console.error("JSON Parse Error. Raw text:", text);
-            throw new Error("Invalid JSON from AI");
+            throw new Error("Failed to parse JSON from AI response: " + rawText.substring(0, 100));
         }
 
-        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(data.layout, null, 2));
-        console.log(`Generated Layout: ${data.layout.sections.length} sections.`);
+        // 6. Save Artifacts
+        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(output.layout, null, 2));
+        console.log(`Layout Saved: ${output.layout.sections.length} sections.`);
 
-        if (data.custom_plugin_php && data.custom_plugin_php.length > 50) {
-            fs.writeFileSync(OUTPUT_PLUGIN, data.custom_plugin_php);
-            console.log("Custom Plugin PHP generated.");
-        } else {
-            console.log("No custom plugin required.");
+        if (output.custom_plugin_php && output.custom_plugin_php.length > 50) {
+            fs.writeFileSync(OUTPUT_PLUGIN, output.custom_plugin_php);
+            console.log("Custom Plugin Saved.");
         }
 
     } catch (error) {
-        console.error("ARCHITECT ERROR:", error);
-        // Fallback Error Layout
+        console.error("CRITICAL ERROR:", error.message);
         const errorLayout = {
-            sections: [{
-                type: 'text',
-                props: {},
-                html: `<div style="padding:50px;background:#ffebee;color:#c62828;border:1px solid #ef9a9a;"><h3>AI Generation Failed</h3><p>${error.message}</p></div>`
+            sections: [{ 
+                type: 'text', 
+                props: {}, 
+                html: `<div style="padding:20px;border:1px solid red;color:red;"><h3>AI Error</h3><p>${error.message}</p></div>` 
             }]
         };
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
-        // Exit 0 to allow artifact upload
         process.exit(0);
     }
 }
 
 function generateCodeSummary(dir) {
     let summary = "";
-    const MAX_CHARS = 300000; // Flash has huge context, we can increase this
+    // Flash Lite has 1M context, we can be generous
+    const MAX_CHARS = 500000; 
     
     function walk(directory) {
         if (summary.length >= MAX_CHARS) return;
@@ -143,16 +126,12 @@ function generateCodeSummary(dir) {
         for (const file of files) {
             const fullPath = path.join(directory, file);
             const stat = fs.statSync(fullPath);
-
             if (stat.isDirectory()) {
-                if (['node_modules', '.git', 'build', 'dist', 'assets', 'images'].includes(file)) continue;
+                if (['node_modules', '.git', 'dist', 'build'].includes(file)) continue;
                 walk(fullPath);
-            } else {
-                if (file.match(/\.(js|jsx|ts|tsx|html|vue|php)$/i)) {
-                    if (file.includes('test') || file.includes('spec')) continue;
-                    const content = fs.readFileSync(fullPath, 'utf8');
-                    summary += `\n--- FILE: ${file} ---\n${content.replace(/\s+/g, ' ')}\n`;
-                }
+            } else if (file.match(/\.(js|jsx|ts|tsx|html|php|css)$/i)) {
+                if (file.includes('lock') || file.includes('config')) continue;
+                summary += `\n--- ${file} ---\n${fs.readFileSync(fullPath, 'utf8')}\n`;
             }
         }
     }
