@@ -9,54 +9,79 @@ const CONTEXT_FILE = 'context.json';
 const OUTPUT_LAYOUT = 'layout.json';
 const OUTPUT_PLUGIN = 'plugin.php';
 
-// Model Configuration
-// Using the specific 2.0 Flash Lite Preview endpoint
+// Model Config (Tier 1 Key)
 const MODEL_NAME = "gemini-2.0-flash-lite-preview-02-05";
 const API_VERSION = "v1beta"; 
 
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log(`GLB Architect (Model: ${MODEL_NAME})`);
+        console.log(`GLB Architect v15.0 (Deep Extractor)`);
         console.log(`Target Builder: ${args.builder}`);
         console.log("----------------------------------------");
 
-        // 1. Validate Inputs
         if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context file missing.");
         const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
-        
-        // 2. Extract Source Code
+
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
         const codeSummary = generateCodeSummary('extracted_source');
         console.log(`Source Code Scanned: ${codeSummary.length} chars`);
 
-        // 3. Prepare AI Request
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) throw new Error("GEMINI_API_KEY is missing.");
 
+        // --- NEW: Data Extraction Prompt ---
         const systemPrompt = `
-        ROLE: Expert WordPress Architect.
-        TARGET BUILDER: ${args.builder}.
-        TASK: Convert React/Angular App to Native WordPress Layouts.
-
-        RULES:
-        1. **Modules**: Use native modules where possible (e.g., "pricing", "accordion", "hero", "blurb_grid", "video").
-        2. **Ecosystem**: If 'divi_machine' is active, use 'machine_loop'. If 'woocommerce', use 'shop_grid'.
-        3. **Security**: Wrap DB writes in 'if (!defined("GLB_PREVIEW_MODE"))'.
-
-        OUTPUT JSON SCHEMA:
+        ROLE: Expert WordPress Data Extractor & Layout Architect.
+        TARGET: ${args.builder} (Divi/Elementor).
+        
+        TASK: Deeply analyze the React/Angular Source Code and extract CONTENT into structured JSON for WordPress modules.
+        
+        ⛔ CRITICAL RULES (DO NOT IGNORE):
+        1. **NO RAW HTML DUMPING**: Do not just copy the source HTML into a 'code' block. You MUST extract the text, links, and images.
+        2. **PRICING TABLES**: Find plans. Extract { title, price, currency, frequency, features[] }. Map to type: "pricing".
+        3. **HERO SECTIONS**: Find the h1, subtitle, and CTA button. Map to type: "hero".
+        4. **GRIDS/FEATURES**: Find repeating divs with icons/images. Map to type: "blurb_grid". Extract { title, content, icon/image }.
+        5. **TESTIMONIALS**: Find quotes/authors. Map to type: "testimonial".
+        6. **FAQ**: Find question/answer pairs. Map to type: "accordion".
+        7. **IMAGES**: If you see an <img> tag, map to type: "image" and capture the 'src'.
+        
+        ECOSYSTEM:
+        - If context has 'divi_machine' and you see a data.map(), use type: 'machine_loop'.
+        
+        OUTPUT SCHEMA (JSON ONLY):
         {
-            "layout": { "sections": [ { "type": "hero|pricing|text", "props": {}, "html": "..." } ] },
-            "custom_plugin_php": "<?php ... (full code or null) ?>"
+            "layout": {
+                "sections": [
+                    {
+                        "type": "hero",
+                        "props": {
+                            "title": "Experience Intelligence",
+                            "subtitle": "Ask questions about our services...",
+                            "cta_text": "Ask Assistant",
+                            "bg_color": "#0f172a" 
+                        }
+                    },
+                    {
+                        "type": "pricing",
+                        "props": {
+                            "items": [
+                                { "title": "Starter", "price": "29", "currency": "$", "features": ["Feature A", "Feature B"] },
+                                { "title": "Pro", "price": "99", "currency": "$", "features": ["All Features"] }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "custom_plugin_php": null
         }`;
 
-        const userMessage = `CONTEXT: ${contextRaw}\n\nCODE:\n${codeSummary}`;
+        const userMessage = `CONTEXT: ${contextRaw}\n\nSOURCE CODE:\n${codeSummary}`;
 
-        // 4. Raw REST Fetch (Bypassing SDK issues)
         const url = `https://generativelanguage.googleapis.com/${API_VERSION}/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
         
-        console.log(`Sending request to ${MODEL_NAME}...`);
+        console.log(`Sending Deep Extraction Request to ${MODEL_NAME}...`);
 
         const response = await fetch(url, {
             method: "POST",
@@ -65,7 +90,7 @@ async function run() {
                 contents: [{ parts: [{ text: systemPrompt + "\n\n" + userMessage }] }],
                 generationConfig: { 
                     response_mime_type: "application/json",
-                    temperature: 0.1 
+                    temperature: 0.1 // Low temp for precision
                 }
             })
         });
@@ -76,12 +101,6 @@ async function run() {
         }
 
         const data = await response.json();
-        
-        // 5. Parse Response
-        if (!data.candidates || !data.candidates[0].content) {
-            throw new Error("Empty response from AI model.");
-        }
-
         const rawText = data.candidates[0].content.parts[0].text;
         const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
         
@@ -89,35 +108,25 @@ async function run() {
         try {
             output = JSON.parse(cleanJson);
         } catch (e) {
-            throw new Error("Failed to parse JSON from AI response: " + rawText.substring(0, 100));
+            throw new Error("Failed to parse JSON: " + rawText.substring(0, 100));
         }
 
-        // 6. Save Artifacts
+        // Save
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(output.layout, null, 2));
-        console.log(`Layout Saved: ${output.layout.sections.length} sections.`);
+        console.log(`Layout Extracted: ${output.layout.sections.length} semantic sections.`);
 
         if (output.custom_plugin_php && output.custom_plugin_php.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, output.custom_plugin_php);
-            console.log("Custom Plugin Saved.");
         }
 
     } catch (error) {
         console.error("CRITICAL ERROR:", error.message);
-        const errorLayout = {
-            sections: [{ 
-                type: 'text', 
-                props: {}, 
-                html: `<div style="padding:20px;border:1px solid red;color:red;"><h3>AI Error</h3><p>${error.message}</p></div>` 
-            }]
-        };
-        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errorLayout));
-        process.exit(0);
+        process.exit(1); // Fail the job so we see the red X
     }
 }
 
 function generateCodeSummary(dir) {
     let summary = "";
-    // Flash Lite has 1M context, we can be generous
     const MAX_CHARS = 500000; 
     
     function walk(directory) {
@@ -127,7 +136,7 @@ function generateCodeSummary(dir) {
             const fullPath = path.join(directory, file);
             const stat = fs.statSync(fullPath);
             if (stat.isDirectory()) {
-                if (['node_modules', '.git', 'dist', 'build'].includes(file)) continue;
+                if (['node_modules', '.git', 'dist', 'build', 'assets'].includes(file)) continue;
                 walk(fullPath);
             } else if (file.match(/\.(js|jsx|ts|tsx|html|php|css)$/i)) {
                 if (file.includes('lock') || file.includes('config')) continue;
