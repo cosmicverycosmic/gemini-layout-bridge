@@ -9,83 +9,58 @@ const CONTEXT_FILE = 'context.json';
 const OUTPUT_LAYOUT = 'layout.json';
 const OUTPUT_PLUGIN = 'plugin.php';
 
-// Model Config (Stable Tier 1)
 const MODEL_NAME = "gemini-2.0-flash-lite-preview-02-05";
 const API_VERSION = "v1beta"; 
 
 async function run() {
     try {
         console.log("----------------------------------------");
-        console.log(`GLB Architect v16.0 (Deep Component Mapping)`);
+        console.log(`GLB Architect v16 (Component Extractor)`);
         console.log(`Target: ${args.builder}`);
         console.log("----------------------------------------");
 
-        if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context missing.");
-        const context = JSON.parse(fs.readFileSync(CONTEXT_FILE, 'utf8'));
+        if (!fs.existsSync(CONTEXT_FILE)) throw new Error("Context missing");
+        const contextRaw = fs.readFileSync(CONTEXT_FILE, 'utf8');
         
         const zip = new AdmZip(SOURCE_ZIP);
         zip.extractAllTo('extracted_source', true);
         const codeSummary = generateCodeSummary('extracted_source');
-        console.log(`Source Code: ${codeSummary.length} chars`);
+        console.log(`Code Length: ${codeSummary.length}`);
 
         const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) throw new Error("GEMINI_API_KEY missing.");
+        if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
         const systemPrompt = `
-        ROLE: Senior Divi Theme Architect.
-        TASK: Convert React/Angular code into a structured JSON definition for Divi Builder.
+        ROLE: Senior Divi Architect.
+        TASK: Extract UI components from code and map them to NATIVE DIVI MODULES.
         
-        ⛔ STRICT PROHIBITION: 
-        Do NOT put large blocks of HTML into a "text" or "code" module. You MUST decompose the UI into specific Divi modules.
+        ⛔ NO RAW HTML FOR KNOWN PATTERNS. You must decompose the UI.
         
-        AVAILABLE MODULES & MAPPING RULES:
-        1. **Hero/Header**: 
-           - Look for: Big H1, Subtitle, Background Image/Color, CTA Button.
-           - Map to: type="hero", props={ title, subtitle, button_text, background_image, background_color }.
+        AVAILABLE MODULES:
+        1. **hero**: title, subtitle, cta_text, background_image (URL).
+        2. **pricing**: items: [{ title, price, currency, features[] }].
+        3. **blurb_grid**: items: [{ title, content, icon }].
+        4. **accordion**: items: [{ question, answer }].
+        5. **video**: src (YouTube/Vimeo URL).
+        6. **number_counter**: title, number.
+        7. **testimonial**: author, job_title, quote.
         
-        2. **Grids (Services/Features)**: 
-           - Look for: Repeating divs with Icons + Title + Text.
-           - Map to: type="blurb_grid", props={ items: [{ title, content, icon, image }] }.
-        
-        3. **Pricing**: 
-           - Look for: Price cards (Currency, Amount, Period, Features List).
-           - Map to: type="pricing", props={ items: [{ title, price, currency, frequency, features[] }] }.
-        
-        4. **FAQ/Accordion**: 
-           - Look for: Question/Answer toggles or Description Lists (<dl>).
-           - Map to: type="accordion", props={ items: [{ question, answer }] }.
-        
-        5. **Media**: 
-           - Video: type="video", props={ src }.
-           - Slider: type="slider", props={ slides: [{ heading, content, image }] }.
-           - Gallery: type="gallery", props={ images: [] }.
-        
-        6. **Interactive**:
-           - Counters: type="number_counter", props={ title, number, percent: true/false }.
-           - Countdown: type="countdown", props={ title, date }.
-           - Social: type="social_follow", props={ networks: [{ network, url }] }.
-           - Contact Form: type="contact_form", props={ title, email }. (Map to 'gravity_form' if detected in context).
-        
-        7. **Ecosystem**:
-           - WooCommerce Products -> type="shop".
-           - Dynamic Blog/News -> type="blog".
-        
-        OUTPUT FORMAT (JSON ONLY):
+        OUTPUT JSON:
         {
             "layout": {
                 "sections": [
-                    { "type": "hero", "props": { ... } },
-                    { "type": "blurb_grid", "props": { "items": [...] } }
+                    { "type": "hero", "props": { "title": "...", "cta_text": "..." } },
+                    { "type": "pricing", "props": { "items": [ { "title": "Pro", "price": "99" } ] } }
                 ]
             },
             "custom_plugin_php": null
         }`;
 
-        const userMessage = `CONTEXT: ${JSON.stringify(context)}\n\nCODE:\n${codeSummary}`;
+        const userMessage = `CONTEXT: ${contextRaw}\n\nCODE:\n${codeSummary}`;
 
-        console.log(`Sending to ${MODEL_NAME}...`);
-
-        const response = await fetch(`https://generativelanguage.googleapis.com/${API_VERSION}/models/${MODEL_NAME}:generateContent?key=${apiKey}`, {
+        const url = `https://generativelanguage.googleapis.com/${API_VERSION}/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
+        
+        const response = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -102,18 +77,17 @@ async function run() {
         const output = JSON.parse(clean);
 
         fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(output.layout, null, 2));
-        console.log(`Layout Saved: ${output.layout.sections.length} sections.`);
+        console.log(`Saved ${output.layout.sections.length} sections.`);
 
         if (output.custom_plugin_php?.length > 50) {
             fs.writeFileSync(OUTPUT_PLUGIN, output.custom_plugin_php);
         }
 
-    } catch (error) {
-        console.error("ERROR:", error.message);
-        const errJson = {
-            sections: [{ type: 'text', props: { content: `<div style="color:red">AI Error: ${error.message}</div>` } }]
-        };
-        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify(errJson));
+    } catch (e) {
+        console.error("ERROR:", e.message);
+        fs.writeFileSync(OUTPUT_LAYOUT, JSON.stringify({
+            sections: [{ type: 'text', props: { content: `<div style="color:red">AI Error: ${e.message}</div>` } }]
+        }));
         process.exit(0);
     }
 }
@@ -127,7 +101,7 @@ function generateCodeSummary(dir) {
         for (const f of files) {
             const fp = path.join(d, f);
             if (fs.statSync(fp).isDirectory()) {
-                if (!['node_modules', '.git', 'dist', 'build', 'assets'].includes(f)) walk(fp);
+                if (!['node_modules', 'dist', 'build', 'assets'].includes(f)) walk(fp);
             } else if (f.match(/\.(js|jsx|ts|tsx|html|vue|php)$/i)) {
                 if (!f.includes('test')) summary += `\n--- ${f} ---\n${fs.readFileSync(fp, 'utf8')}\n`;
             }
