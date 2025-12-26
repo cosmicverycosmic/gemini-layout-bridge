@@ -18,7 +18,7 @@ on:
         required: true
       gemini_key:
         description: 'Google AI Key'
-        required: true
+        required: false
 
 jobs:
   architect-build:
@@ -45,9 +45,7 @@ jobs:
           curl -L "${{ inputs.zip_url }}" --output source.zip
           curl -L "${{ inputs.ctx_url }}" --output context.json
         
-      - name: Run AI Architect
-        env:
-          GEMINI_API_KEY: ${{ inputs.gemini_key }}
+      - name: Run Architect (local parser)
         run: |
           node scripts/analyze.js \
             --job_id "${{ inputs.job_id }}" \
@@ -66,4 +64,5 @@ jobs:
           path: |
             layout.json
             plugin.php
+          if-no-files-found: warn
           retention-days: 1
